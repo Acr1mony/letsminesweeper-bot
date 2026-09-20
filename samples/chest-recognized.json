@@ -1,0 +1,62 @@
+{
+  "window_rect": [
+    0,
+    0,
+    995,
+    470
+  ],
+  "visible_screen_fallback": false,
+  "grid": {
+    "origin": [
+      10.0,
+      97.99999999999984
+    ],
+    "pitch": 32.00000000000004,
+    "rows": 11,
+    "columns": 30
+  },
+  "counts": {
+    "number": 113,
+    "mine_mark": 35,
+    "open": 16,
+    "closed": 165,
+    "treasure": 1
+  },
+  "safe": [
+    [
+      6,
+      10
+    ],
+    [
+      8,
+      14
+    ],
+    [
+      10,
+      14
+    ]
+  ],
+  "mines": [
+    [
+      1,
+      15
+    ],
+    [
+      7,
+      14
+    ],
+    [
+      9,
+      14
+    ],
+    [
+      10,
+      12
+    ],
+    [
+      10,
+      13
+    ]
+  ],
+  "contradictions": []
+}

@@ -1,0 +1,46 @@
+{
+  "window_rect": [
+    0,
+    0,
+    837,
+    490
+  ],
+  "visible_screen_fallback": false,
+  "grid": {
+    "origin": [
+      24.0,
+      113.99999999999989
+    ],
+    "pitch": 33.500000000000064,
+    "rows": 11,
+    "columns": 24
+  },
+  "counts": {
+    "number": 123,
+    "open": 14,
+    "mine_mark": 40,
+    "closed": 86,
+    "open_mine": 1
+  },
+  "safe": [
+    [
+      2,
+      15
+    ],
+    [
+      5,
+      15
+    ]
+  ],
+  "mines": [
+    [
+      3,
+      15
+    ],
+    [
+      10,
+      16
+    ]
+  ],
+  "contradictions": []
+}
