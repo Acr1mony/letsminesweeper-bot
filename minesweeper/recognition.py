@@ -25,6 +25,9 @@ class Cell:
     kind: CellKind
     number: int | None = None
     confidence: float = 1.0
+    # Only used by treasure cells: "open" or "closed", distinguishing the
+    # two chest appearances so automation can pick the ones worth clicking.
+    variant: str | None = None
 
 
 DIGIT_COLORS = {
@@ -100,7 +103,17 @@ def classify_cell(cell_rgb: np.ndarray, row: int, column: int) -> Cell:
     is_closed_chest = gold_ratio >= 0.12 and orange_ratio >= 0.08
     if open_ratio >= 0.15 and (is_open_chest or is_closed_chest):
         confidence = min(1.0, 0.55 + gold_ratio + max(brown_ratio, orange_ratio) * 0.5)
-        return Cell(row, column, CellKind.TREASURE, number=0, confidence=confidence)
+        # The two chest arts separate cleanly on brown (open ≈ 0.19,
+        # closed ≈ 0.04), which decides whether the chest still wants a click.
+        variant = "open" if brown_ratio >= 0.10 else "closed"
+        return Cell(
+            row,
+            column,
+            CellKind.TREASURE,
+            number=0,
+            confidence=confidence,
+            variant=variant,
+        )
 
     best_number = 0
     best_ratio = 0.0

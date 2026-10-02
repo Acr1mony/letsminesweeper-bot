@@ -21,14 +21,34 @@ from minesweeper.automation import (
     plan_drag,
 )
 from minesweeper.capture import CaptureFrame
-from minesweeper.input_control import WindowInputController
+from minesweeper.input_control import BatchExecution, WindowInputController
 from minesweeper.observer import WindowObserver, board_motion_ratio, observe_image
-from minesweeper.recognition import CellKind, classify_cell
-from minesweeper.solver import SolveResult
+from minesweeper.recognition import Cell, CellKind, classify_cell
+from minesweeper.dialogs import (
+    detect_cyan_dialog,
+    detect_death_dialog,
+    detect_revive_button,
+    detect_welfare_confirm,
+)
+from minesweeper.solver import Constraint, SolveResult, _enumerate_component, solve_local
 from minesweeper.statistics import StatisticsStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def grid_from_cells(
+    rows: int,
+    columns: int,
+    overrides: list[tuple[int, int, CellKind, int | None]],
+) -> list[list[Cell]]:
+    grid = [
+        [Cell(row, column, CellKind.OPEN, number=0) for column in range(columns)]
+        for row in range(rows)
+    ]
+    for row, column, kind, number in overrides:
+        grid[row][column] = Cell(row, column, kind, number=number)
+    return grid
 
 
 class RecognitionTests(unittest.TestCase):
@@ -96,15 +116,17 @@ class ReplayTests(unittest.TestCase):
             )
         self.assertEqual(actual, [row[:26] for row in expected[:11]])
         self.assertFalse(observation.result.contradictions)
-        self.assertEqual(len(observation.result.safe), 7)
-        self.assertEqual(len(observation.result.mines), 2)
+        # Direct rules and subset differences find 7/2; the exhaustive
+        # component stage surfaces four more pattern deductions.
+        self.assertEqual(len(observation.result.safe), 11)
+        self.assertEqual(len(observation.result.mines), 3)
 
     def test_current_view_is_planned_as_one_fast_batch(self) -> None:
         observation = observe_image(Image.open(ROOT / "samples" / "initial.png"))
         action = plan_action(observation, LocalNavigator())
         self.assertEqual(action.kind, ActionKind.BATCH)
-        self.assertEqual(len(action.safe), 7)
-        self.assertEqual(len(action.marks), 2)
+        self.assertEqual(len(action.safe), 11)
+        self.assertEqual(len(action.marks), 3)
 
     def test_no_moves_plans_a_local_drag_without_world_map(self) -> None:
         observation = observe_image(Image.open(ROOT / "samples" / "initial.png"))
@@ -180,8 +202,8 @@ class ReplayTests(unittest.TestCase):
         self.assertFalse(
             [cell for row in observation.grid for cell in row if cell.kind == CellKind.UNRECOGNIZED]
         )
-        self.assertEqual(len(observation.result.safe), 23)
-        self.assertEqual(len(observation.result.mines), 10)
+        self.assertEqual(len(observation.result.safe), 24)
+        self.assertEqual(len(observation.result.mines), 11)
 
     def test_yellow_chest_is_an_open_safe_cell(self) -> None:
         observation = observe_image(Image.open(ROOT / "samples" / "chest-raw.png"))
@@ -323,7 +345,7 @@ class ReplayTests(unittest.TestCase):
         self.assertIs(recovered, valid)
         self.assertEqual(controller.drags, 3)
 
-    def test_empty_view_drags_eight_times_before_completing(self) -> None:
+    def test_empty_view_keeps_exploring_until_five_minutes(self) -> None:
         source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
         empty_grid = [
             [replace(cell, kind=CellKind.OPEN, number=0, confidence=1.0) for cell in row]
@@ -352,15 +374,23 @@ class ReplayTests(unittest.TestCase):
             def drag(self, *args: object, **kwargs: object) -> None:
                 self.drags += 1
 
+        now = [1000.0]
         controller = FakeController()
-        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        automation = LocalAutomation(
+            observer=FakeObserver(),
+            controller=controller,
+            clock=lambda: now[0],
+        )
         outcomes = [automation.perform_cycle(threading.Event()) for _ in range(9)]
-        self.assertEqual(controller.drags, 8)
-        self.assertTrue(all(outcome.action.kind == ActionKind.DRAG for outcome in outcomes[:8]))
-        self.assertEqual(outcomes[8].action.kind, ActionKind.COMPLETE)
-        self.assertIn("连续 8 次", outcomes[8].message)
+        self.assertTrue(all(outcome.action.kind == ActionKind.DRAG for outcome in outcomes))
+        self.assertEqual(controller.drags, 9)
+        now[0] += automation.EMPTY_VIEW_TIMEOUT_SECONDS + 1.0
+        final = automation.perform_cycle(threading.Event())
+        self.assertEqual(final.action.kind, ActionKind.COMPLETE)
+        self.assertIn("5 分钟", final.message)
+        self.assertIn("自动运行结束", final.message)
 
-    def test_empty_view_counter_resets_when_closed_cells_reappear(self) -> None:
+    def test_empty_view_timer_resets_when_closed_cells_reappear(self) -> None:
         source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
         empty_grid = [
             [replace(cell, kind=CellKind.OPEN, number=0, confidence=1.0) for cell in row]
@@ -390,6 +420,7 @@ class ReplayTests(unittest.TestCase):
         outcome = automation.perform_cycle(threading.Event())
         self.assertIn("发现新的未开启格", outcome.message)
         self.assertEqual(automation.empty_view_drags, 0)
+        self.assertIsNone(automation.empty_view_started_at)
 
     def test_cleared_view_first_searches_toward_last_action(self) -> None:
         source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
@@ -659,6 +690,622 @@ class ReplayTests(unittest.TestCase):
         self.assertIsNotNone(advice)
         self.assertIn("F8", advice or "")
         self.assertIn("更换区域", advice or "")
+
+
+class DeductionTests(unittest.TestCase):
+    def test_1_2_1_pattern_is_fully_deduced(self) -> None:
+        # Numbers 1-2-1 over a row of five closed cells have exactly one
+        # consistent assignment; subset differences alone find none of it.
+        grid = grid_from_cells(
+            5,
+            7,
+            [
+                (1, 0, CellKind.CLOSED, None),
+                (1, 1, CellKind.CLOSED, None),
+                (1, 2, CellKind.CLOSED, None),
+                (1, 3, CellKind.CLOSED, None),
+                (1, 4, CellKind.CLOSED, None),
+                (2, 1, CellKind.NUMBER, 1),
+                (2, 2, CellKind.NUMBER, 2),
+                (2, 3, CellKind.NUMBER, 1),
+            ],
+        )
+        result = solve_local(grid)
+        self.assertFalse(result.contradictions)
+        self.assertEqual(result.mines, {(1, 1), (1, 3)})
+        self.assertTrue({(1, 0), (1, 2), (1, 4)} <= result.safe)
+
+    def test_overlapping_pair_with_different_counts_is_deduced(self) -> None:
+        # {a,b}=1 next to {b,c}=2 has the unique solution b=c=1, a=0; the two
+        # constraints are the same size, so subset differences cannot see it.
+        grid = grid_from_cells(
+            5,
+            7,
+            [
+                (1, 1, CellKind.CLOSED, None),
+                (1, 2, CellKind.CLOSED, None),
+                (1, 3, CellKind.CLOSED, None),
+                (2, 1, CellKind.NUMBER, 1),
+                (2, 3, CellKind.NUMBER, 2),
+            ],
+        )
+        result = solve_local(grid)
+        self.assertFalse(result.contradictions)
+        self.assertEqual(result.mines, {(1, 2), (1, 3)})
+        self.assertIn((1, 1), result.safe)
+
+    def test_loose_constraint_never_reports_guesses(self) -> None:
+        # One constraint over 30 cells with 10 mines has an astronomical
+        # solution space and no definite cell; the enumeration must exhaust
+        # its budget (or abort early) without ever reporting a guess.
+        cells = frozenset((100, column) for column in range(30))
+        mines, safe, _truncated = _enumerate_component(frozenset({Constraint(cells, 10)}))
+        self.assertEqual(mines, frozenset())
+        self.assertEqual(safe, frozenset())
+
+
+class ViewportTrailTests(unittest.TestCase):
+    def test_trail_records_viewport_positions(self) -> None:
+        navigator = LocalNavigator()
+        navigator.move_viewport(0.0, 12.0)
+        self.assertEqual(navigator.position, (0.0, 12.0))
+        self.assertEqual(len(navigator.trail), 2)
+        self.assertGreaterEqual(navigator.revisit_count("left"), 1)
+        self.assertEqual(navigator.revisit_count("right"), 0)
+
+    def test_straight_line_progress_is_never_penalized(self) -> None:
+        for direction, step in LocalNavigator.STEP_CELLS.items():
+            with self.subTest(direction=direction):
+                navigator = LocalNavigator()
+                navigator.move_viewport(step[0], step[1])
+                self.assertEqual(navigator.revisit_count(direction), 0)
+
+    def test_avoid_revisit_prefers_fresh_frontier_direction(self) -> None:
+        navigator = LocalNavigator()
+        navigator.move_viewport(0.0, 12.0)
+        scores = {"right": 10.0, "down": 5.0, "left": 0.0, "up": 0.0}
+        # Going left would return to the origin viewport; right is fresh and
+        # scores highest, so it wins over down.
+        direction, avoided = navigator._avoid_revisit("left", scores)
+        self.assertTrue(avoided)
+        self.assertEqual(direction, "right")
+
+    def test_avoid_revisit_keeps_direction_without_alternatives(self) -> None:
+        navigator = LocalNavigator()
+        navigator.position = (0.0, 12.0)
+        # Every direction's nominal target has been visited once already, so
+        # there is no fresher alternative and the original choice must stand.
+        navigator.trail = [
+            (0.0, 12.0),
+            (0.0, 24.0),
+            (8.0, 12.0),
+            (0.0, 0.0),
+            (-8.0, 12.0),
+        ]
+        scores = {"right": 10.0, "down": 0.0, "left": 0.0, "up": 0.0}
+        direction, avoided = navigator._avoid_revisit("right", scores)
+        self.assertFalse(avoided)
+        self.assertEqual(direction, "right")
+
+    def test_performed_drag_is_recorded_in_trail(self) -> None:
+        source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        columns = len(source.grid[0])
+        split = columns // 2
+        view = [
+            [
+                replace(
+                    cell,
+                    kind=CellKind.OPEN if cell.column < split else CellKind.CLOSED,
+                    number=0 if cell.column < split else None,
+                    confidence=1.0,
+                )
+                for cell in row
+            ]
+            for row in source.grid
+        ]
+        before = replace(source, grid=view, result=SolveResult(frozenset(), frozenset(), tuple(), tuple()))
+        opened_cell = replace(before.grid[5][split], kind=CellKind.OPEN, number=0, confidence=1.0)
+        after_grid = [row[:] for row in before.grid]
+        after_grid[5][split] = opened_cell
+        after = replace(before, grid=after_grid)
+
+        class FakeObserver:
+            def __call__(self):
+                return before
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return after
+
+        class FakeController:
+            def activate_target(self):
+                return 1, before.frame.window_rect
+
+            def drag(self, *args: object, **kwargs: object) -> None:
+                return None
+
+        automation = LocalAutomation(observer=FakeObserver(), controller=FakeController())
+        outcome = automation.perform_cycle(threading.Event())
+        self.assertEqual(outcome.action.kind, ActionKind.DRAG)
+        self.assertEqual(len(automation.navigator.trail), 2)
+        self.assertNotEqual(automation.navigator.position, (0.0, 0.0))
+
+    def test_failed_drag_leaves_trail_unchanged(self) -> None:
+        source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        empty_grid = [
+            [replace(cell, kind=CellKind.OPEN, number=0, confidence=1.0) for cell in row]
+            for row in source.grid
+        ]
+        empty = replace(
+            source,
+            grid=empty_grid,
+            result=SolveResult(frozenset(), frozenset(), tuple(), tuple()),
+        )
+
+        class FakeObserver:
+            def __call__(self):
+                return empty
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return empty
+
+        class FakeController:
+            def activate_target(self):
+                return 1, empty.frame.window_rect
+
+            def drag(self, *args: object, **kwargs: object) -> None:
+                return None
+
+        automation = LocalAutomation(observer=FakeObserver(), controller=FakeController())
+        automation.perform_cycle(threading.Event())
+        self.assertEqual(automation.navigator.trail, [(0.0, 0.0)])
+        self.assertEqual(automation.navigator.position, (0.0, 0.0))
+
+
+class DialogTests(unittest.TestCase):
+    @staticmethod
+    def _death_array() -> np.ndarray:
+        return np.array(Image.open(ROOT / "samples" / "death-state.png").convert("RGB"))
+
+    @classmethod
+    def _dialog_only_array(cls) -> np.ndarray:
+        # The countdown phase: death dialog present, revive button not yet.
+        array = cls._death_array().copy()
+        array[265:315, 305:415] = (228, 247, 247)
+        return array
+
+    @staticmethod
+    def _sample_array(name: str) -> np.ndarray:
+        return np.array(Image.open(ROOT / "samples" / name).convert("RGB"))
+
+    @staticmethod
+    def _frame(image: Image.Image) -> CaptureFrame:
+        return CaptureFrame(image, (0, 0, image.width, image.height), False)
+
+    def test_death_dialog_and_button_are_detected(self) -> None:
+        death = self._death_array()
+        self.assertTrue(detect_death_dialog(death))
+        button = detect_revive_button(death)
+        self.assertIsNotNone(button)
+        assert button is not None
+        self.assertAlmostEqual(button[0], 360, delta=6)
+        self.assertAlmostEqual(button[1], 288, delta=6)
+
+    def test_normal_frames_do_not_trigger_any_dialog(self) -> None:
+        for name in ("initial.png", "chest-raw.png", "resized-raw.png"):
+            with self.subTest(sample=name):
+                array = self._sample_array(name)
+                self.assertFalse(detect_cyan_dialog(array))
+                self.assertFalse(detect_death_dialog(array))
+                self.assertIsNone(detect_revive_button(array))
+                self.assertIsNone(detect_welfare_confirm(array))
+
+    def test_welfare_dialog_is_detected_without_death(self) -> None:
+        welfare = self._sample_array("welfare-chest-dialog.png")
+        self.assertTrue(detect_cyan_dialog(welfare))
+        self.assertFalse(detect_death_dialog(welfare))
+        self.assertIsNone(detect_revive_button(welfare))
+        confirm = detect_welfare_confirm(welfare)
+        self.assertIsNotNone(confirm)
+        assert confirm is not None
+        self.assertAlmostEqual(confirm[0], 352, delta=6)
+        self.assertAlmostEqual(confirm[1], 348, delta=6)
+
+    def test_reward_dialog_keeps_green_button_but_is_not_death(self) -> None:
+        reward = self._sample_array("chest-reward-dialog.png")
+        self.assertTrue(detect_cyan_dialog(reward))
+        self.assertFalse(detect_death_dialog(reward))
+        button = detect_revive_button(reward)
+        self.assertIsNotNone(button)
+        assert button is not None
+        self.assertAlmostEqual(button[0], 353, delta=6)
+        self.assertAlmostEqual(button[1], 282, delta=6)
+
+    def test_chest_variant_classification(self) -> None:
+        closed = observe_image(Image.open(ROOT / "samples" / "closed-chest-raw.png"))
+        opened = observe_image(Image.open(ROOT / "samples" / "chest-raw.png"))
+        closed_cells = [
+            cell for row in closed.grid for cell in row if cell.kind == CellKind.TREASURE
+        ]
+        opened_cells = [
+            cell for row in opened.grid for cell in row if cell.kind == CellKind.TREASURE
+        ]
+        self.assertEqual([(cell.variant) for cell in closed_cells], ["closed"])
+        self.assertEqual([(cell.variant) for cell in opened_cells], ["open"])
+
+    def test_dismiss_modals_clicks_welfare_confirm(self) -> None:
+        welfare_image = Image.fromarray(self._sample_array("welfare-chest-dialog.png"))
+
+        class FakeObserver:
+            def raw_frame(self) -> CaptureFrame:
+                return DialogTests._frame(welfare_image)
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        self.assertTrue(automation._dismiss_modals(threading.Event()))
+        self.assertEqual(len(controller.clicks), 1)
+        self.assertAlmostEqual(controller.clicks[0][0], 352, delta=6)
+        self.assertAlmostEqual(controller.clicks[0][1], 348, delta=6)
+        self.assertIn("福利宝箱", automation.recovery_note or "")
+
+    def test_dismiss_modals_clicks_reward_confirm_not_revive(self) -> None:
+        reward_image = Image.fromarray(self._sample_array("chest-reward-dialog.png"))
+
+        class FakeObserver:
+            def raw_frame(self) -> CaptureFrame:
+                return DialogTests._frame(reward_image)
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        self.assertTrue(automation._dismiss_modals(threading.Event()))
+        self.assertAlmostEqual(controller.clicks[0][0], 353, delta=6)
+        self.assertAlmostEqual(controller.clicks[0][1], 282, delta=6)
+        self.assertIn("宝箱奖励", automation.recovery_note or "")
+        self.assertNotIn("复活", automation.recovery_note or "")
+
+    def test_dismiss_modals_clicks_revive_on_death_frame(self) -> None:
+        death_image = Image.fromarray(self._death_array())
+
+        class FakeObserver:
+            def raw_frame(self) -> CaptureFrame:
+                return DialogTests._frame(death_image)
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return valid
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+        valid = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        self.assertTrue(automation._dismiss_modals(threading.Event()))
+        self.assertAlmostEqual(controller.clicks[0][0], 360, delta=6)
+        self.assertAlmostEqual(controller.clicks[0][1], 288, delta=6)
+        self.assertIn("复活", automation.recovery_note or "")
+
+    def test_dismiss_modals_waits_for_revive_during_countdown(self) -> None:
+        dialog_image = Image.fromarray(self._dialog_only_array())
+        button_image = Image.fromarray(self._death_array())
+
+        class FakeObserver:
+            def __init__(self) -> None:
+                self.frames = [dialog_image, dialog_image, button_image]
+                self.captures = 0
+
+            def raw_frame(self) -> CaptureFrame:
+                self.captures += 1
+                return DialogTests._frame(
+                    self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
+                )
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return valid
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+        valid = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        self.assertTrue(automation._dismiss_modals(threading.Event()))
+        self.assertEqual(len(controller.clicks), 1)
+        self.assertEqual(automation.observer.captures, 3)
+        self.assertIn("复活", automation.recovery_note or "")
+
+    def test_dismiss_modals_times_out_without_button(self) -> None:
+        dialog_image = Image.fromarray(self._dialog_only_array())
+
+        class FakeObserver:
+            def raw_frame(self) -> CaptureFrame:
+                return DialogTests._frame(dialog_image)
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+        automation = LocalAutomation(observer=FakeObserver(), controller=FakeController())
+        automation.REVIVE_WAIT_SECONDS = 0.2
+        automation.REVIVE_POLL_INTERVAL = 0.05
+        self.assertFalse(automation._dismiss_modals(threading.Event()))
+        self.assertIsNone(automation.recovery_note)
+
+    def test_dismiss_modals_skips_normal_frames(self) -> None:
+        normal_image = Image.open(ROOT / "samples" / "initial.png").convert("RGB")
+
+        class FakeObserver:
+            def raw_frame(self) -> CaptureFrame:
+                return DialogTests._frame(normal_image)
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        self.assertFalse(automation._dismiss_modals(threading.Event()))
+        self.assertEqual(controller.clicks, [])
+        self.assertIsNone(automation.recovery_note)
+
+    def test_recovery_prefers_dialog_handling_over_recovery_drags(self) -> None:
+        valid = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        abnormal = replace(
+            valid,
+            result=SolveResult(frozenset(), frozenset(), tuple(), ("模拟识别异常",)),
+        )
+        death_image = Image.fromarray(self._death_array())
+
+        class FakeObserver:
+            def raw_frame(self) -> CaptureFrame:
+                return DialogTests._frame(death_image)
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return valid
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks = 0
+                self.drags = 0
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks += len(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+            def drag(self, *args: object, **kwargs: object) -> None:
+                self.drags += 1
+
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        recovered = automation._recover_recognition(
+            threading.Event(),
+            abnormal,
+            abnormal.frame.window_rect,
+            "模拟识别异常",
+        )
+        self.assertIs(recovered, valid)
+        self.assertEqual(controller.drags, 0)
+        self.assertEqual(controller.clicks, 1)
+        self.assertIn("复活", automation.recovery_note or "")
+
+    def test_recovery_note_is_appended_to_messages(self) -> None:
+        automation = LocalAutomation(observer=None, controller=None)
+        self.assertEqual(automation._with_note("本批执行 1 个标雷"), "本批执行 1 个标雷")
+        automation.recovery_note = "已自动开启宝箱并领取奖励"
+        self.assertEqual(
+            automation._with_note("本批执行 1 个标雷"),
+            "本批执行 1 个标雷；已自动开启宝箱并领取奖励",
+        )
+
+
+class ChestFlowTests(unittest.TestCase):
+    @staticmethod
+    def _frame(image: Image.Image) -> CaptureFrame:
+        return CaptureFrame(image, (0, 0, image.width, image.height), False)
+
+    @staticmethod
+    def _image(name: str) -> Image.Image:
+        return Image.open(ROOT / "samples" / name).convert("RGB")
+
+    def test_closed_chest_center_targets_treasure_cell(self) -> None:
+        closed = observe_image(self._image("closed-chest-raw.png"))
+        opened = observe_image(self._image("chest-raw.png"))
+        automation = LocalAutomation(observer=None, controller=None)
+        self.assertEqual(
+            automation._closed_chest_center(closed),
+            closed.geometry.center(3, 2),
+        )
+        self.assertIsNone(automation._closed_chest_center(opened))
+
+    def test_open_closed_chest_clicks_cell_then_both_confirms(self) -> None:
+        welfare_image = self._image("welfare-chest-dialog.png")
+        reward_image = self._image("chest-reward-dialog.png")
+
+        class FakeObserver:
+            def __init__(self) -> None:
+                self.frames = [welfare_image, welfare_image, reward_image, reward_image]
+
+            def raw_frame(self) -> CaptureFrame:
+                return ChestFlowTests._frame(
+                    self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
+                )
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        handled = automation._open_closed_chest(
+            threading.Event(),
+            (0, 0, 708, 454),
+            (150, 200),
+        )
+        self.assertTrue(handled)
+        self.assertEqual(len(controller.clicks), 3)
+        self.assertEqual(controller.clicks[0], (150, 200))
+        self.assertAlmostEqual(controller.clicks[1][0], 352, delta=6)
+        self.assertAlmostEqual(controller.clicks[1][1], 348, delta=6)
+        self.assertAlmostEqual(controller.clicks[2][0], 353, delta=6)
+        self.assertAlmostEqual(controller.clicks[2][1], 282, delta=6)
+        self.assertIn("宝箱奖励", automation.recovery_note or "")
+
+    def test_chest_flow_fails_without_dialog(self) -> None:
+        normal_image = self._image("initial.png")
+
+        class FakeObserver:
+            def raw_frame(self) -> CaptureFrame:
+                return ChestFlowTests._frame(normal_image)
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        automation.CHEST_DIALOG_TIMEOUT = 0.2
+        automation.CHEST_POLL_INTERVAL = 0.05
+        self.assertFalse(
+            automation._open_closed_chest(threading.Event(), (0, 0, 721, 460), (100, 200))
+        )
+        self.assertEqual(automation.chest_failures, 0)
+        self.assertEqual(len(controller.clicks), 1)
+
+    def test_perform_cycle_opens_chest_before_batch(self) -> None:
+        closed = observe_image(self._image("closed-chest-raw.png"))
+        other = observe_image(self._image("initial.png"))
+        welfare_image = self._image("welfare-chest-dialog.png")
+        reward_image = self._image("chest-reward-dialog.png")
+
+        class FakeObserver:
+            def __init__(self) -> None:
+                self.stable = iter((closed, other))
+                self.raw_frames = iter(
+                    [
+                        ChestFlowTests._frame(welfare_image),
+                        ChestFlowTests._frame(welfare_image),
+                        ChestFlowTests._frame(reward_image),
+                        ChestFlowTests._frame(reward_image),
+                    ]
+                )
+
+            def __call__(self):
+                return closed
+
+            def raw_frame(self) -> CaptureFrame:
+                return next(self.raw_frames)
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return next(self.stable)
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+                self.drags = 0
+
+            def activate_target(self):
+                return 1, closed.frame.window_rect
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+            def drag(self, *args: object, **kwargs: object) -> None:
+                self.drags += 1
+
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        outcome = automation.perform_cycle(threading.Event())
+        self.assertEqual(outcome.action.kind, ActionKind.BATCH)
+        self.assertGreaterEqual(len(controller.clicks), 3)
+        self.assertEqual(
+            controller.clicks[0],
+            closed.geometry.center(3, 2),
+        )
+        self.assertAlmostEqual(controller.clicks[1][0], 352, delta=6)
+        self.assertAlmostEqual(controller.clicks[1][1], 348, delta=6)
+        self.assertAlmostEqual(controller.clicks[2][0], 353, delta=6)
+        self.assertAlmostEqual(controller.clicks[2][1], 282, delta=6)
+        self.assertIn("已自动开启宝箱", outcome.message)
+        self.assertEqual(automation.chest_failures, 0)
+
+    def test_chest_opening_stops_after_repeated_failures(self) -> None:
+        closed = observe_image(self._image("closed-chest-raw.png"))
+        other = observe_image(self._image("initial.png"))
+
+        class FakeObserver:
+            def __call__(self):
+                return closed
+
+            def raw_frame(self) -> CaptureFrame:
+                raise AssertionError("宝箱开启已被禁用，不应再截取对话框")
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return other
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+                self.drags = 0
+
+            def activate_target(self):
+                return 1, closed.frame.window_rect
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+            def drag(self, *args: object, **kwargs: object) -> None:
+                self.drags += 1
+
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=FakeController())
+        automation.chest_failures = automation.MAX_CHEST_FAILURES
+        outcome = automation.perform_cycle(threading.Event())
+        self.assertNotIn("宝箱", outcome.message)
+        self.assertEqual(automation.chest_failures, automation.MAX_CHEST_FAILURES)
+        # The cycle still works normally on the same observation.
+        self.assertEqual(outcome.action.kind, ActionKind.BATCH)
 
 
 if __name__ == "__main__":

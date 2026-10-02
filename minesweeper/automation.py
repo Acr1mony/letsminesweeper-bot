@@ -8,6 +8,15 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 
+import numpy as np
+
+from .capture import CaptureFrame
+from .dialogs import (
+    detect_cyan_dialog,
+    detect_death_dialog,
+    detect_revive_button,
+    detect_welfare_confirm,
+)
 from .input_control import BatchExecution, BatchPoints, WindowInputController
 from .observer import Observation, WindowObserver
 from .recognition import Cell, CellKind
@@ -51,7 +60,8 @@ def view_signature(observation: Observation) -> str:
     for row in observation.grid:
         values.append(
             ",".join(
-                f"{cell.kind.value}:{cell.number if cell.number is not None else ''}" for cell in row
+                f"{cell.kind.value}:{cell.number if cell.number is not None else ''}:{cell.variant or ''}"
+                for cell in row
             )
         )
     return hashlib.sha1("|".join(values).encode("utf-8")).hexdigest()
@@ -169,6 +179,11 @@ def interior_closed_island(
 class LocalNavigator:
     DIRECTIONS = ("right", "down", "left", "up")
     OPPOSITE = {"right": "left", "left": "right", "up": "down", "down": "up"}
+    # Nominal viewport travel per drag in board cells, mirroring plan_drag.
+    STEP_CELLS = {"right": (0.0, 12.0), "left": (0.0, -12.0), "down": (8.0, 0.0), "up": (-8.0, 0.0)}
+    # Two viewport centres closer than this share most of their content, so
+    # arriving there counts as revisiting the same spot.
+    REVISIT_RADIUS = 6.0
 
     def __init__(self) -> None:
         self.rotation = 0
@@ -179,6 +194,49 @@ class LocalNavigator:
         self.last_closed_direction: str | None = None
         self.island_escape_direction: str | None = None
         self.last_mode = "frontier"
+        # Single-run trail of viewport centres in virtual board coordinates.
+        # It is deliberately not a world map: only "where have we been" is
+        # kept, so exploration can avoid returning to familiar ground.
+        self.position: tuple[float, float] = (0.0, 0.0)
+        self.trail: list[tuple[float, float]] = [(0.0, 0.0)]
+
+    def move_viewport(self, row_delta: float, column_delta: float) -> None:
+        self.position = (self.position[0] + row_delta, self.position[1] + column_delta)
+        self.trail.append(self.position)
+
+    def revisit_count(self, direction: str) -> int:
+        row_step, column_step = self.STEP_CELLS[direction]
+        target_row = self.position[0] + row_step
+        target_column = self.position[1] + column_step
+        return sum(
+            1
+            for row, column in self.trail
+            if abs(row - target_row) <= self.REVISIT_RADIUS
+            and abs(column - target_column) <= self.REVISIT_RADIUS
+        )
+
+    def _avoid_revisit(self, direction: str, scores: dict[str, float]) -> tuple[str, bool]:
+        visits = self.revisit_count(direction)
+        if visits == 0:
+            return direction, False
+        any_positive = any(score > 0 for score in scores.values())
+        origin = self.DIRECTIONS.index(direction)
+        alternatives: list[str] = []
+        for candidate in self.DIRECTIONS:
+            if candidate == direction or self.revisit_count(candidate) >= visits:
+                continue
+            if any_positive and scores.get(candidate, 0.0) <= 0:
+                continue
+            alternatives.append(candidate)
+        if not alternatives:
+            return direction, False
+        alternatives.sort(
+            key=lambda item: (
+                -scores.get(item, 0.0),
+                (self.DIRECTIONS.index(item) - origin) % len(self.DIRECTIONS),
+            )
+        )
+        return alternatives[0], True
 
     def remember(self, signature: str) -> None:
         if signature in self.recent_views:
@@ -302,9 +360,10 @@ class LocalNavigator:
                 direction = counterclockwise
             else:
                 direction = reverse
+        direction, avoided = self._avoid_revisit(direction, scores)
         self.rotation = (self.DIRECTIONS.index(direction) + 1) % len(self.DIRECTIONS)
         self.last_direction = direction
-        self.last_mode = "frontier" if frontier else "density"
+        self.last_mode = "trail" if avoided else ("frontier" if frontier else "density")
         return direction
 
     def turn_clockwise(self) -> str:
@@ -425,8 +484,18 @@ def plan_action(observation: Observation, navigator: LocalNavigator) -> PlannedA
 
 class LocalAutomation:
     MAX_RECOVERY_DRAGS = 8
-    MAX_EMPTY_VIEW_DRAGS = 8
+    # An emptied viewport is explored by dragging until either closed cells
+    # reappear or this budget runs out; drags alone are not a stop condition.
+    EMPTY_VIEW_TIMEOUT_SECONDS = 300.0
     LAST_ACTION_DIRECTION_DRAGS = 1
+    # Stepping on a mine opens a death dialog whose revive button only
+    # appears after a six-second countdown, so the wait must exceed it.
+    REVIVE_WAIT_SECONDS = 15.0
+    REVIVE_POLL_INTERVAL = 0.3
+    # Welfare/reward dialogs after clicking a closed chest.
+    CHEST_DIALOG_TIMEOUT = 8.0
+    CHEST_POLL_INTERVAL = 0.25
+    MAX_CHEST_FAILURES = 3
 
     def __init__(
         self,
@@ -440,10 +509,13 @@ class LocalAutomation:
         self.navigator = LocalNavigator()
         self.last_observation: Observation | None = None
         self.empty_view_drags = 0
+        self.empty_view_started_at: float | None = None
         self.last_action_direction: str | None = None
         self.clock = clock
         self.statistics = statistics
         self.search_started_at: float | None = None
+        self.recovery_note: str | None = None
+        self.chest_failures = 0
 
     @staticmethod
     def _wait(stop_event: threading.Event, seconds: float) -> None:
@@ -452,6 +524,7 @@ class LocalAutomation:
             time.sleep(min(0.025, deadline - time.monotonic()))
 
     def perform_cycle(self, stop_event: threading.Event) -> StepOutcome:
+        self.recovery_note = None
         activate_target = getattr(self.controller, "activate_target", None)
         active_rect: tuple[int, int, int, int] | None = None
         if callable(activate_target):
@@ -464,18 +537,36 @@ class LocalAutomation:
         if issue is not None:
             before = self._recover_recognition(stop_event, before, active_rect, issue)
         self.last_observation = before
+        chest_center = self._closed_chest_center(before)
+        if chest_center is not None and self.chest_failures < self.MAX_CHEST_FAILURES:
+            if stop_event.is_set():
+                return StepOutcome(before, PlannedAction(ActionKind.BATCH), 0, "已暂停")
+            handled = self._open_closed_chest(stop_event, before.frame.window_rect, chest_center)
+            if handled:
+                self.chest_failures = 0
+                self.recovery_note = "已自动开启宝箱并领取奖励"
+            else:
+                self.chest_failures += 1
+            if stop_event.is_set():
+                return StepOutcome(before, PlannedAction(ActionKind.BATCH), 0, "已暂停")
+            before = self._observe_after_chest(stop_event, before)
+            self.last_observation = before
         before_signature = view_signature(before)
         self.navigator.remember(before_signature)
         action = plan_action(before, self.navigator)
         exploring_empty_view = action.kind == ActionKind.COMPLETE
         forced_last_action_probe = False
         if exploring_empty_view:
-            if self.empty_view_drags >= self.MAX_EMPTY_VIEW_DRAGS:
+            if self.empty_view_started_at is None:
+                self.empty_view_started_at = self.clock()
+                self.search_started_at = None
+            elif self.clock() - self.empty_view_started_at >= self.EMPTY_VIEW_TIMEOUT_SECONDS:
+                minutes = int(self.EMPTY_VIEW_TIMEOUT_SECONDS // 60)
                 return StepOutcome(
                     before,
                     action,
                     0,
-                    f"连续 {self.MAX_EMPTY_VIEW_DRAGS} 次拖动后仍未发现未开启格，自动运行结束",
+                    f"连续拖动 {minutes} 分钟仍未发现未开启格，自动运行结束",
                 )
             forced_direction = (
                 self.last_action_direction
@@ -487,6 +578,7 @@ class LocalAutomation:
             self.empty_view_drags += 1
         else:
             self.empty_view_drags = 0
+            self.empty_view_started_at = None
         if action.kind == ActionKind.BATCH:
             self.search_started_at = None
             last_position = action.safe[-1] if action.safe else action.marks[-1]
@@ -545,7 +637,9 @@ class LocalAutomation:
             self.last_observation = after
             if not stop_event.is_set() and view_signature(after) == before_signature:
                 raise RuntimeError("批量点击后棋盘没有变化，自动模式已停止")
-            message = f"本批执行 {len(action.marks)} 个标雷、{len(action.safe)} 个开格"
+            message = self._with_note(
+                f"本批执行 {len(action.marks)} 个标雷、{len(action.safe)} 个开格"
+            )
             return StepOutcome(
                 after,
                 action,
@@ -588,6 +682,9 @@ class LocalAutomation:
             after = self._recover_recognition(stop_event, after, after.frame.window_rect, issue)
         self.last_observation = after
         after_signature = view_signature(after)
+        # Empty-view exploration is a sanctioned long search: the one-minute
+        # frontier advice would only mislead while it runs.
+        advice = None if exploring_empty_view else self._search_advice()
         if not stop_event.is_set() and after_signature == before_signature:
             if forced_last_action_probe:
                 return StepOutcome(
@@ -595,12 +692,17 @@ class LocalAutomation:
                     action,
                     1,
                     f"{self._empty_exploration_message(action)}，本次拖动未改变视口",
-                    self._search_advice(),
+                    advice,
                 )
             next_direction = self.navigator.turn_clockwise()
             message = f"当前方向已到边界，下一步顺时针转向 {next_direction}"
-            return StepOutcome(after, action, 1, message, self._search_advice())
+            return StepOutcome(after, action, 1, message, advice)
         self.navigator.remember(after_signature)
+        pitch = before.geometry.pitch
+        self.navigator.move_viewport(
+            -(action.drag_end[1] - action.drag_start[1]) / pitch,
+            -(action.drag_end[0] - action.drag_start[0]) / pitch,
+        )
         if exploring_empty_view:
             has_closed = any(
                 cell.kind == CellKind.CLOSED
@@ -610,30 +712,33 @@ class LocalAutomation:
             if has_closed:
                 explored = self.empty_view_drags
                 self.empty_view_drags = 0
+                self.empty_view_started_at = None
+                self.search_started_at = None
                 return StepOutcome(
                     after,
                     action,
                     1,
                     f"拖动 {explored} 次后发现新的未开启格",
-                    self._search_advice(),
+                    advice,
                 )
             return StepOutcome(
                 after,
                 action,
                 1,
                 self._empty_exploration_message(action),
-                self._search_advice(),
+                advice,
             )
-        navigation_message = (
-            f"跳过中央孤立未开区，向{action.direction}寻找新的外围边界"
-            if action.navigation_mode == "island_escape"
-            else f"顺时针沿未开区域边缘向{action.direction}探索，并校正开/未开比例"
-        )
+        if action.navigation_mode == "island_escape":
+            navigation_message = f"跳过中央孤立未开区，向{action.direction}寻找新的外围边界"
+        elif action.navigation_mode == "trail":
+            navigation_message = f"该方向区域已探索过，转向{action.direction}避免重复"
+        else:
+            navigation_message = f"顺时针沿未开区域边缘向{action.direction}探索，并校正开/未开比例"
         return StepOutcome(
             after,
             action,
             1,
-            navigation_message,
+            self._with_note(navigation_message),
             self._search_advice(),
         )
 
@@ -664,7 +769,14 @@ class LocalAutomation:
                 f"当前视口已清空，沿最后操作方向 {action.direction} 查找"
                 f"（{self.empty_view_drags}/{self.LAST_ACTION_DIRECTION_DRAGS}）"
             )
-        return f"当前视口已清空，继续探索（{self.empty_view_drags}/{self.MAX_EMPTY_VIEW_DRAGS}）"
+        elapsed = 0.0
+        if self.empty_view_started_at is not None:
+            elapsed = max(0.0, self.clock() - self.empty_view_started_at)
+        budget = int(self.EMPTY_VIEW_TIMEOUT_SECONDS // 60)
+        return (
+            "当前视口已清空，继续探索"
+            f"（已 {int(elapsed // 60)} 分 {int(elapsed % 60)} 秒 / {budget} 分钟）"
+        )
 
     def _generic_recovery_action(
         self,
@@ -688,6 +800,150 @@ class LocalAutomation:
             drag_end=(start[0] + delta[0], start[1] + delta[1]),
         )
 
+    def _with_note(self, message: str) -> str:
+        if self.recovery_note:
+            return f"{message}；{self.recovery_note}"
+        return message
+
+    def _fresh_image(self) -> tuple[CaptureFrame, np.ndarray] | None:
+        raw_frame = getattr(self.observer, "raw_frame", None)
+        if not callable(raw_frame):
+            return None
+        try:
+            frame = raw_frame()
+        except (RuntimeError, ValueError):
+            return None
+        return frame, np.array(frame.image.convert("RGB"))
+
+    def _click_point(self, frame: CaptureFrame, point: tuple[int, int], stop_event: threading.Event) -> None:
+        self.controller.click_batch(
+            frame.window_rect,
+            BatchPoints(marks=(), safe=(point,)),
+            stop_event,
+        )
+
+    def _dismiss_modals(self, stop_event: threading.Event) -> bool:
+        """Detect and dismiss one step of any known modal dialog.
+
+        Returns False immediately when the frame shows no known dialog so
+        ordinary recognition problems go straight to recovery drags. Dialog
+        clicks are never counted as opened cells."""
+        captured = self._fresh_image()
+        if captured is None:
+            return False
+        frame, image = captured
+        if detect_cyan_dialog(image):
+            amber = detect_welfare_confirm(image)
+            if amber is not None:
+                self._click_point(frame, amber, stop_event)
+                self.recovery_note = "已确认福利宝箱"
+                return True
+        green = detect_revive_button(image)
+        if green is not None and not detect_death_dialog(image):
+            self._click_point(frame, green, stop_event)
+            self.recovery_note = "已领取宝箱奖励"
+            return True
+        if detect_death_dialog(image):
+            return self._wait_and_revive(stop_event)
+        return False
+
+    def _wait_and_revive(self, stop_event: threading.Event) -> bool:
+        """Wait out the death countdown, then click the revive button."""
+        deadline = time.monotonic() + self.REVIVE_WAIT_SECONDS
+        captured = self._fresh_image()
+        button = detect_revive_button(captured[1]) if captured else None
+        while button is None:
+            if stop_event.is_set() or stop_event.wait(self.REVIVE_POLL_INTERVAL):
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            captured = self._fresh_image()
+            if captured is None:
+                return False
+            button = detect_revive_button(captured[1])
+        frame, _ = captured
+        self._click_point(frame, button, stop_event)
+        self.recovery_note = "检测到踩雷，已自动点击复活"
+        return True
+
+    def _modal_present(self, image: np.ndarray) -> bool:
+        if not detect_cyan_dialog(image):
+            return False
+        return (
+            detect_welfare_confirm(image) is not None
+            or detect_revive_button(image) is not None
+            or detect_death_dialog(image)
+        )
+
+    def _wait_for_modal(self, stop_event: threading.Event, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            captured = self._fresh_image()
+            if captured is not None and self._modal_present(captured[1]):
+                return True
+            if stop_event.is_set() or stop_event.wait(self.CHEST_POLL_INTERVAL):
+                return False
+            if time.monotonic() >= deadline:
+                return False
+
+    def _open_closed_chest(
+        self,
+        stop_event: threading.Event,
+        rect: tuple[int, int, int, int],
+        center: tuple[int, int],
+    ) -> bool:
+        """Click a closed chest cell, then dismiss the welfare and reward
+        dialogs. Returns False when the expected dialogs never appear."""
+        self.controller.click_batch(
+            rect,
+            BatchPoints(marks=(), safe=(center,)),
+            stop_event,
+        )
+        if not self._wait_for_modal(stop_event, self.CHEST_DIALOG_TIMEOUT):
+            return False
+        self._dismiss_modals(stop_event)
+        if self._wait_for_modal(stop_event, self.CHEST_DIALOG_TIMEOUT):
+            self._dismiss_modals(stop_event)
+        return True
+
+    def _closed_chest_center(self, observation: Observation) -> tuple[int, int] | None:
+        candidates = [
+            cell
+            for row in observation.grid
+            for cell in row
+            if cell.kind == CellKind.TREASURE and cell.variant == "closed"
+        ]
+        if not candidates:
+            return None
+        rows = len(observation.grid)
+        columns = len(observation.grid[0])
+        center_row = (rows - 1) / 2.0
+        center_column = (columns - 1) / 2.0
+        target = min(
+            candidates,
+            key=lambda cell: (cell.row - center_row) ** 2 + (cell.column - center_column) ** 2,
+        )
+        return observation.geometry.center(target.row, target.column)
+
+    def _observe_after_chest(self, stop_event: threading.Event, previous: Observation) -> Observation:
+        wait_for_stable = getattr(self.observer, "wait_for_stable", None)
+        try:
+            if callable(wait_for_stable):
+                candidate = wait_for_stable(
+                    stop_event,
+                    force_redetect=True,
+                    initial_delay=0.3,
+                )
+            else:
+                self._wait(stop_event, 0.8)
+                candidate = self.observer()
+        except (ValueError, RuntimeError) as error:
+            return self._recover_recognition(stop_event, previous, previous.frame.window_rect, str(error))
+        issue = recognition_issue(candidate)
+        if issue is not None:
+            return self._recover_recognition(stop_event, candidate, candidate.frame.window_rect, issue)
+        return candidate
+
     def _recover_recognition(
         self,
         stop_event: threading.Event,
@@ -701,6 +957,23 @@ class LocalAutomation:
         for attempt in range(self.MAX_RECOVERY_DRAGS):
             if stop_event.is_set():
                 raise RuntimeError("自动运行已停止")
+            if self._dismiss_modals(stop_event):
+                try:
+                    if callable(wait_for_stable):
+                        candidate = wait_for_stable(
+                            stop_event,
+                            force_redetect=True,
+                            initial_delay=0.4,
+                        )
+                    else:
+                        self._wait(stop_event, 0.8)
+                        candidate = self.observer()
+                except (ValueError, RuntimeError):
+                    continue
+                if recognition_issue(candidate) is None:
+                    self.last_observation = candidate
+                    return candidate
+                continue
             if current is not None:
                 action = plan_drag(current, self.navigator)
                 rect = current.frame.window_rect
@@ -729,6 +1002,12 @@ class LocalAutomation:
                 continue
             issue = recognition_issue(candidate)
             if issue is None:
+                if current is not None:
+                    pitch = current.geometry.pitch
+                    self.navigator.move_viewport(
+                        -(action.drag_end[1] - action.drag_start[1]) / pitch,
+                        -(action.drag_end[0] - action.drag_start[0]) / pitch,
+                    )
                 self.last_observation = candidate
                 return candidate
             last_error = issue

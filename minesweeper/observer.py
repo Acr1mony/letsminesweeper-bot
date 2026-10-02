@@ -117,6 +117,10 @@ class WindowObserver:
         frame = capture_window(self.title)
         return self._from_frame(frame, force_redetect=False)
 
+    def raw_frame(self) -> CaptureFrame:
+        """Fresh window capture without any grid recognition."""
+        return capture_window(self.title)
+
     def _from_frame(self, frame: CaptureFrame, force_redetect: bool) -> Observation:
         rgb = np.array(frame.image.convert("RGB"))
         size_changed = self.image_size != frame.image.size
