@@ -20,6 +20,7 @@ from minesweeper.automation import (
     interior_closed_island,
     plan_action,
     plan_drag,
+    recognition_issue,
 )
 from minesweeper.capture import CaptureFrame
 from minesweeper.input_control import BatchExecution, WindowInputController
@@ -1460,6 +1461,91 @@ class EscapeTests(unittest.TestCase):
         self.assertIsNone(automation.escape_direction)
         self.assertEqual(automation.escape_moves_done, 0)
         self.assertEqual(len(automation.recent_drag_directions), 0)
+
+
+class RecoveryHardeningTests(unittest.TestCase):
+    @staticmethod
+    def _observation():
+        valid = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        abnormal = replace(
+            valid,
+            result=SolveResult(
+                frozenset(),
+                frozenset(),
+                tuple(),
+                ("数字 (6,7)=2 与周围状态矛盾：已标雷 3，未知 1",),
+            ),
+        )
+        return valid, abnormal
+
+    def test_contradiction_issue_reports_offending_cell(self) -> None:
+        _valid, abnormal = self._observation()
+        issue = recognition_issue(abnormal)
+        self.assertIsNotNone(issue)
+        assert issue is not None
+        self.assertIn("约束矛盾", issue)
+        self.assertIn("(6,7)", issue)
+        self.assertIn("已标雷 3", issue)
+
+    def test_recovery_settles_without_dragging_when_view_clears(self) -> None:
+        valid, abnormal = self._observation()
+
+        class FakeObserver:
+            def __init__(self) -> None:
+                self.reads = iter((valid,))
+
+            def __call__(self):
+                return next(self.reads)
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return valid
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.drags = 0
+
+            def drag(self, *args: object, **kwargs: object) -> None:
+                self.drags += 1
+
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        recovered = automation._recover_recognition(
+            threading.Event(),
+            abnormal,
+            abnormal.frame.window_rect,
+            "模拟识别异常",
+        )
+        self.assertIs(recovered, valid)
+        self.assertEqual(controller.drags, 0)
+
+    def test_recovery_drops_pitch_hint_after_repeated_failures(self) -> None:
+        _valid, abnormal = self._observation()
+
+        class FakeObserver:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                self.calls.append(dict(kwargs))
+                return abnormal
+
+        class FakeController:
+            def drag(self, *args: object, **kwargs: object) -> None:
+                return None
+
+        automation = LocalAutomation(observer=FakeObserver(), controller=FakeController())
+        with self.assertRaisesRegex(RuntimeError, "8 次恢复拖动"):
+            automation._recover_recognition(
+                threading.Event(),
+                abnormal,
+                abnormal.frame.window_rect,
+                "模拟识别异常",
+            )
+        calls = automation.observer.calls
+        self.assertEqual(len(calls), 8)
+        self.assertFalse(calls[0]["drop_pitch_hint"])
+        self.assertFalse(calls[1]["drop_pitch_hint"])
+        self.assertTrue(all(call["drop_pitch_hint"] for call in calls[2:]))
 
 
 if __name__ == "__main__":

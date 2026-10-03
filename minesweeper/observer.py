@@ -121,11 +121,18 @@ class WindowObserver:
         """Fresh window capture without any grid recognition."""
         return capture_window(self.title)
 
-    def _from_frame(self, frame: CaptureFrame, force_redetect: bool) -> Observation:
+    def _from_frame(
+        self,
+        frame: CaptureFrame,
+        force_redetect: bool = False,
+        drop_pitch_hint: bool = False,
+    ) -> Observation:
         rgb = np.array(frame.image.convert("RGB"))
         size_changed = self.image_size != frame.image.size
         if self.geometry is None or size_changed or force_redetect:
-            pitch_hint = None if self.geometry is None or size_changed else self.geometry.pitch
+            pitch_hint = None
+            if not drop_pitch_hint and self.geometry is not None and not size_changed:
+                pitch_hint = self.geometry.pitch
             self.geometry = detect_grid(rgb, pitch_hint=pitch_hint)
             self.image_size = frame.image.size
         grid = recognize_grid(rgb, self.geometry)
@@ -145,6 +152,7 @@ class WindowObserver:
         interval: float = 0.09,
         stable_pairs: int = 3,
         motion_threshold: float = 0.002,
+        drop_pitch_hint: bool = False,
     ) -> Observation:
         """Wait for animation/dragging to stop before any grid recognition."""
         if initial_delay > 0 and stop_event.wait(initial_delay):
@@ -167,7 +175,11 @@ class WindowObserver:
             stable_count = stable_count + 1 if motion <= motion_threshold else 0
             if stable_count >= stable_pairs:
                 try:
-                    return self._from_frame(current_frame, force_redetect=force_redetect)
+                    return self._from_frame(
+                        current_frame,
+                        force_redetect=force_redetect,
+                        drop_pitch_hint=drop_pitch_hint,
+                    )
                 except ValueError:
                     stable_count = 0
             previous_rgb = current_rgb

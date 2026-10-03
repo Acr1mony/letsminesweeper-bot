@@ -70,7 +70,9 @@ def view_signature(observation: Observation) -> str:
 
 def recognition_issue(observation: Observation) -> str | None:
     if observation.result.contradictions:
-        return "识别结果存在约束矛盾"
+        # Surface the first concrete contradiction so a persistent failure can
+        # be traced to the exact cell instead of a generic complaint.
+        return f"识别结果存在约束矛盾（{observation.result.contradictions[0]}）"
     unknown_count = sum(
         cell.kind == CellKind.UNRECOGNIZED
         for row in observation.grid
@@ -1012,6 +1014,21 @@ class LocalAutomation:
         current = observation
         last_error = reason
         wait_for_stable = getattr(self.observer, "wait_for_stable", None)
+        # Transient artifacts (score text, fading overlays) often clear on
+        # their own: give the current view one quiet re-read before moving.
+        observer_call = self.observer if callable(self.observer) else None
+        if observer_call is not None:
+            if stop_event.is_set():
+                raise RuntimeError("自动运行已停止")
+            self._wait(stop_event, 0.45)
+            try:
+                settle = observer_call()
+            except (ValueError, RuntimeError):
+                settle = None
+            if settle is not None and recognition_issue(settle) is None:
+                self.recent_drag_directions.clear()
+                self.last_observation = settle
+                return settle
         for attempt in range(self.MAX_RECOVERY_DRAGS):
             if stop_event.is_set():
                 raise RuntimeError("自动运行已停止")
@@ -1050,6 +1067,9 @@ class LocalAutomation:
                         stop_event,
                         force_redetect=True,
                         initial_delay=0.08,
+                        # Later attempts drop the cached pitch so a lattice
+                        # locked onto wrong lines cannot survive the recovery.
+                        drop_pitch_hint=attempt >= 2,
                     )
                 else:
                     self._wait(stop_event, 0.65)
