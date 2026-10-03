@@ -2,9 +2,22 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def default_statistics_path() -> Path:
+    """Statistics live next to the project — or next to the exe when frozen.
+
+    A PyInstaller onefile bundle extracts to a temporary directory, so
+    deriving the location from __file__ would scatter stats between runs."""
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).resolve().parent
+    else:
+        base = Path(__file__).resolve().parents[1]
+    return base / "data" / "statistics.json"
 
 
 @dataclass(frozen=True)
@@ -15,7 +28,7 @@ class StatisticsSnapshot:
 
 class StatisticsStore:
     def __init__(self, path: Path | None = None) -> None:
-        self.path = path or Path(__file__).resolve().parents[1] / "data" / "statistics.json"
+        self.path = path or default_statistics_path()
         self._lock = threading.Lock()
         self._snapshot = self._load()
 

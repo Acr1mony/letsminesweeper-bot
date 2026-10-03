@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import threading
 import time
 from collections import deque
@@ -192,7 +193,6 @@ class LocalNavigator:
         self.repeated_views = 0
         self.last_open_direction: str | None = None
         self.last_closed_direction: str | None = None
-        self.island_escape_direction: str | None = None
         self.last_mode = "frontier"
         # Single-run trail of viewport centres in virtual board coordinates.
         # It is deliberately not a world map: only "where have we been" is
@@ -265,34 +265,6 @@ class LocalNavigator:
         if visible_closed_direction is not None:
             self.last_closed_direction = visible_closed_direction
         ratio = closed_ratio(observation)
-        island = interior_closed_island(observation)
-        if ratio == 0.0:
-            self.island_escape_direction = None
-        if island is not None and self.island_escape_direction is None:
-            island_row, island_column = island
-            distances = {
-                "up": island_row,
-                "down": rows - 1 - island_row,
-                "left": island_column,
-                "right": columns - 1 - island_column,
-            }
-            nearest_distance = min(distances.values())
-            tied = [
-                direction
-                for direction in self.DIRECTIONS
-                if abs(distances[direction] - nearest_distance) < 0.5
-            ]
-            self.island_escape_direction = (
-                self.last_direction if self.last_direction in tied else tied[0]
-            )
-        if self.island_escape_direction is not None and 0.0 < ratio <= 0.30:
-            direction = self.island_escape_direction or self.last_direction or self.DIRECTIONS[self.rotation]
-            self.last_mode = "island_escape"
-            self.rotation = (self.DIRECTIONS.index(direction) + 1) % len(self.DIRECTIONS)
-            self.last_direction = direction
-            return direction
-        if ratio > 0.30:
-            self.island_escape_direction = None
         if ratio >= 0.70:
             direction = visible_open_direction or self.last_open_direction
             if direction is not None:
@@ -373,8 +345,6 @@ class LocalNavigator:
             index = self.DIRECTIONS.index(self.last_direction)
             self.last_direction = self.DIRECTIONS[(index + 1) % len(self.DIRECTIONS)]
         self.rotation = (self.DIRECTIONS.index(self.last_direction) + 1) % len(self.DIRECTIONS)
-        if self.last_mode == "island_escape":
-            self.island_escape_direction = self.last_direction
         return self.last_direction
 
 
@@ -408,10 +378,7 @@ def plan_drag(
     vertical = min(geometry.pitch * 8.0, geometry.full_rows * geometry.pitch * 0.75)
     ratio = closed_ratio(observation)
     rescue_mode = ratio >= 0.70 or ratio <= 0.30
-    if navigator.last_mode == "island_escape":
-        horizontal = geometry.pitch * 8.0
-        vertical = geometry.pitch * 6.0
-    elif rescue_mode:
+    if rescue_mode:
         imbalance = min(1.0, abs(ratio - 0.5) / 0.5)
         horizontal = geometry.pitch * (3.0 + imbalance * 3.0)
         vertical = geometry.pitch * (2.5 + imbalance * 2.5)
@@ -488,6 +455,12 @@ class LocalAutomation:
     # reappear or this budget runs out; drags alone are not a stop condition.
     EMPTY_VIEW_TIMEOUT_SECONDS = 300.0
     LAST_ACTION_DIRECTION_DRAGS = 1
+    # Stuck-navigation escape: when the navigation drags keep alternating
+    # between opposite directions or keep rotating the same way, burst away
+    # in a random direction before resuming the normal sweep.
+    OSCILLATION_THRESHOLD = 8
+    ROTATION_THRESHOLD = 4
+    ESCAPE_MOVES = 8
     # Stepping on a mine opens a death dialog whose revive button only
     # appears after a six-second countdown, so the wait must exceed it.
     REVIVE_WAIT_SECONDS = 15.0
@@ -516,6 +489,11 @@ class LocalAutomation:
         self.search_started_at: float | None = None
         self.recovery_note: str | None = None
         self.chest_failures = 0
+        # Stuck-navigation detection over the recent navigation-drag directions.
+        self.recent_drag_directions: deque[str] = deque(maxlen=self.OSCILLATION_THRESHOLD)
+        self.escape_direction: str | None = None
+        self.escape_moves_done = 0
+        self.rng = random.Random()
 
     @staticmethod
     def _wait(stop_event: threading.Event, seconds: float) -> None:
@@ -579,8 +557,15 @@ class LocalAutomation:
         else:
             self.empty_view_drags = 0
             self.empty_view_started_at = None
+        escape_note = None
+        if action.kind == ActionKind.DRAG:
+            action, escape_note = self._apply_escape_or_record(before, action)
         if action.kind == ActionKind.BATCH:
             self.search_started_at = None
+            # Productive work breaks any suspected navigation loop.
+            self.recent_drag_directions.clear()
+            self.escape_direction = None
+            self.escape_moves_done = 0
             last_position = action.safe[-1] if action.safe else action.marks[-1]
             self.last_action_direction = self._position_direction(before, last_position)
         elif action.kind == ActionKind.DRAG and self.search_started_at is None:
@@ -691,12 +676,12 @@ class LocalAutomation:
                     after,
                     action,
                     1,
-                    f"{self._empty_exploration_message(action)}，本次拖动未改变视口",
+                    escape_note or f"{self._empty_exploration_message(action)}，本次拖动未改变视口",
                     advice,
                 )
             next_direction = self.navigator.turn_clockwise()
             message = f"当前方向已到边界，下一步顺时针转向 {next_direction}"
-            return StepOutcome(after, action, 1, message, advice)
+            return StepOutcome(after, action, 1, escape_note or message, advice)
         self.navigator.remember(after_signature)
         pitch = before.geometry.pitch
         self.navigator.move_viewport(
@@ -714,23 +699,25 @@ class LocalAutomation:
                 self.empty_view_drags = 0
                 self.empty_view_started_at = None
                 self.search_started_at = None
+                # Closed cells are visible again: the escape has done its job.
+                self.recent_drag_directions.clear()
+                self.escape_direction = None
+                self.escape_moves_done = 0
                 return StepOutcome(
                     after,
                     action,
                     1,
-                    f"拖动 {explored} 次后发现新的未开启格",
+                    escape_note or f"拖动 {explored} 次后发现新的未开启格",
                     advice,
                 )
             return StepOutcome(
                 after,
                 action,
                 1,
-                self._empty_exploration_message(action),
+                escape_note or self._empty_exploration_message(action),
                 advice,
             )
-        if action.navigation_mode == "island_escape":
-            navigation_message = f"跳过中央孤立未开区，向{action.direction}寻找新的外围边界"
-        elif action.navigation_mode == "trail":
+        if action.navigation_mode == "trail":
             navigation_message = f"该方向区域已探索过，转向{action.direction}避免重复"
         else:
             navigation_message = f"顺时针沿未开区域边缘向{action.direction}探索，并校正开/未开比例"
@@ -738,8 +725,8 @@ class LocalAutomation:
             after,
             action,
             1,
-            self._with_note(navigation_message),
-            self._search_advice(),
+            self._with_note(escape_note or navigation_message),
+            advice,
         )
 
     def _search_advice(self) -> str | None:
@@ -925,6 +912,77 @@ class LocalAutomation:
         )
         return observation.geometry.center(target.row, target.column)
 
+    def _stuck_pattern(self) -> str | None:
+        """Classify the recent navigation drags: oscillation, rotation or None.
+
+        Oscillation means the last moves keep flipping to the exact opposite
+        direction (up/down/up/...). Rotation means every consecutive pair of
+        moves turns the same way by 90 degrees (a full circle)."""
+        directions = list(self.recent_drag_directions)
+        opposite = LocalNavigator.OPPOSITE
+        if len(directions) >= self.OSCILLATION_THRESHOLD and all(
+            opposite[directions[index]] == directions[index + 1]
+            for index in range(self.OSCILLATION_THRESHOLD - 1)
+        ):
+            return "oscillation"
+        if len(directions) >= self.ROTATION_THRESHOLD:
+            order = LocalNavigator.DIRECTIONS
+            window = directions[-self.ROTATION_THRESHOLD :]
+            turns = {
+                (order.index(window[index + 1]) - order.index(window[index])) % len(order)
+                for index in range(len(window) - 1)
+            }
+            if len(turns) == 1 and turns <= {1, 3}:
+                return "rotation"
+        return None
+
+    def _apply_escape_or_record(
+        self,
+        observation: Observation,
+        action: PlannedAction,
+    ) -> tuple[PlannedAction, str | None]:
+        """Track navigation-drag directions and run the escape burst.
+
+        Returns the (possibly re-planned) drag action plus a status note for
+        the tactical console; the note is None on ordinary drags."""
+        if self.escape_direction is not None:
+            self.escape_moves_done += 1
+            action = plan_drag(observation, self.navigator, forced_direction=self.escape_direction)
+            if self.escape_moves_done >= self.ESCAPE_MOVES:
+                note = f"脱困移动完成（{self.escape_moves_done}/{self.ESCAPE_MOVES}），继续扫雷"
+                self.escape_direction = None
+                self.escape_moves_done = 0
+                self.recent_drag_directions.clear()
+            else:
+                note = (
+                    f"脱困移动中，向{self.escape_direction}"
+                    f"（{self.escape_moves_done}/{self.ESCAPE_MOVES}）"
+                )
+            return action, note
+        if action.direction is None:
+            return action, None
+        # An isolated closed island is an immediate escape trigger: burst away
+        # in a random direction instead of orbiting or fleeing on a fixed edge.
+        if interior_closed_island(observation) is not None:
+            return self._start_escape(observation, "中央孤立未开区")
+        self.recent_drag_directions.append(action.direction)
+        pattern = self._stuck_pattern()
+        if pattern is None:
+            return action, None
+        label = "导航方向往复振荡" if pattern == "oscillation" else "导航方向绕圈旋转"
+        return self._start_escape(observation, label)
+
+    def _start_escape(
+        self,
+        observation: Observation,
+        label: str,
+    ) -> tuple[PlannedAction, str | None]:
+        direction = self.rng.choice(LocalNavigator.DIRECTIONS)
+        self.escape_direction = direction
+        self.escape_moves_done = 1
+        action = plan_drag(observation, self.navigator, forced_direction=direction)
+        return action, f"检测到{label}，向{direction}脱困移动（1/{self.ESCAPE_MOVES}）"
+
     def _observe_after_chest(self, stop_event: threading.Event, previous: Observation) -> Observation:
         wait_for_stable = getattr(self.observer, "wait_for_stable", None)
         try:
@@ -1008,6 +1066,8 @@ class LocalAutomation:
                         -(action.drag_end[1] - action.drag_start[1]) / pitch,
                         -(action.drag_end[0] - action.drag_start[0]) / pitch,
                     )
+                # The recovery detour breaks any navigation-direction streak.
+                self.recent_drag_directions.clear()
                 self.last_observation = candidate
                 return candidate
             last_error = issue

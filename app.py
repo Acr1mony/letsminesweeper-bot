@@ -6,6 +6,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import ttk
 
@@ -18,16 +19,23 @@ from minesweeper.recognition import CellKind
 from minesweeper.statistics import StatisticsSnapshot, StatisticsStore
 
 
+APP_VERSION = "V1.2"
+GITHUB_URL = "https://github.com/Acr1mony/letsminesweeper-bot"
+
+# 深色战术台配色。
 COLORS = {
-    "snow": "#EEF3F1",
-    "paper": "#F9FBFA",
-    "ink": "#263238",
-    "muted": "#687773",
-    "pine": "#285A4A",
-    "safe": "#2E86AB",
-    "mine": "#D9574E",
-    "warning": "#CD8925",
-    "line": "#CAD5D1",
+    "snow": "#101820",
+    "paper": "#182230",
+    "ink": "#E8EEF4",
+    "muted": "#93A1B0",
+    "pine": "#1E8E68",
+    "pine_hover": "#26A87C",
+    "safe": "#55A8FF",
+    "mine": "#FF7A70",
+    "warning": "#F5B944",
+    "line": "#26333F",
+    "canvas": "#0B1016",
+    "link": "#6FB7FF",
 }
 
 
@@ -56,7 +64,7 @@ def observation_report(observation: Observation) -> dict[str, object]:
 class ObserverApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Let's Minesweeper · 局部自动驾驶")
+        self.root.title(f"Let's Minesweeper 扫雷助手 {APP_VERSION}")
         self.root.geometry("900x560+10+30")
         self.root.minsize(700, 430)
         self.root.configure(bg=COLORS["snow"])
@@ -68,13 +76,14 @@ class ObserverApp:
         self.refresh_thread: threading.Thread | None = None
         self.countdown_job: str | None = None
         self.stop_event = threading.Event()
+        self._f8_was_down = False
         self.worker: threading.Thread | None = None
         self.events: queue.SimpleQueue[tuple[str, object]] = queue.SimpleQueue()
         self.statistics = StatisticsStore()
         self.automation = LocalAutomation(statistics=self.statistics)
         self.last_observation: Observation | None = None
         self.auto_refresh = tk.BooleanVar(value=False)
-        self.status = tk.StringVar(value="准备读取当前视口")
+        self.status = tk.StringVar(value="正在准备，请打开游戏窗口")
         self.advice = tk.StringVar(value="")
         self.mode_text = tk.StringVar(value="观察")
         self.safe_text = tk.StringVar(value="—")
@@ -97,24 +106,59 @@ class ObserverApp:
         style.configure("Sidebar.TFrame", background=COLORS["paper"])
         style.configure("TLabel", background=COLORS["snow"], foreground=COLORS["ink"], font=("Microsoft YaHei UI", 9))
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 15, "bold"), foreground=COLORS["pine"])
-        style.configure("Mode.TLabel", font=("Microsoft YaHei UI", 9, "bold"), foreground=COLORS["mine"])
+        style.configure(
+            "Version.TLabel",
+            background=COLORS["snow"],
+            foreground=COLORS["warning"],
+            font=("Bahnschrift", 10, "bold"),
+        )
+        style.configure("Mode.TLabel", font=("Microsoft YaHei UI", 9, "bold"), foreground=COLORS["warning"])
         style.configure("Metric.TLabel", background=COLORS["paper"], font=("Bahnschrift", 18, "bold"), foreground=COLORS["ink"])
         style.configure("Caption.TLabel", background=COLORS["paper"], font=("Microsoft YaHei UI", 8), foreground=COLORS["muted"])
-        style.configure("TButton", font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 6), background=COLORS["pine"], foreground="white")
-        style.map("TButton", background=[("active", "#34715E")])
-        style.configure("TCheckbutton", background=COLORS["paper"], font=("Microsoft YaHei UI", 9), foreground=COLORS["ink"])
+        style.configure(
+            "TButton",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padding=(10, 6),
+            background=COLORS["pine"],
+            foreground="#FFFFFF",
+        )
+        style.map(
+            "TButton",
+            background=[("active", COLORS["pine_hover"]), ("disabled", COLORS["line"])],
+            foreground=[("disabled", COLORS["muted"])],
+        )
+        style.configure(
+            "TCheckbutton",
+            background=COLORS["paper"],
+            foreground=COLORS["ink"],
+            font=("Microsoft YaHei UI", 9),
+            focuscolor=COLORS["paper"],
+        )
+        style.map(
+            "TCheckbutton",
+            background=[("active", COLORS["paper"])],
+            indicatorcolor=[("selected", COLORS["pine"]), ("!selected", COLORS["line"])],
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background=COLORS["line"],
+            troughcolor=COLORS["snow"],
+            arrowcolor=COLORS["muted"],
+            bordercolor=COLORS["paper"],
+        )
 
         shell = ttk.Frame(self.root, padding=10)
         shell.pack(fill="both", expand=True)
         header = ttk.Frame(shell)
         header.pack(fill="x", pady=(0, 7))
-        ttk.Label(header, text="局部自动驾驶", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="当前视口 · 本地离线", foreground=COLORS["muted"]).pack(side="left", padx=10, pady=(3, 0))
+        ttk.Label(header, text="扫雷助手", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text=APP_VERSION, style="Version.TLabel").pack(side="left", padx=(8, 0), pady=(4, 0))
+        ttk.Label(header, text="实时识别 · 自动开图 · 完全离线", foreground=COLORS["muted"]).pack(side="left", padx=10, pady=(3, 0))
         ttk.Label(header, textvariable=self.mode_text, style="Mode.TLabel").pack(side="right", pady=(3, 0))
 
         content = ttk.Frame(shell)
         content.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(content, bg="#DDE5E2", highlightthickness=1, highlightbackground=COLORS["line"])
+        self.canvas = tk.Canvas(content, bg=COLORS["canvas"], highlightthickness=1, highlightbackground=COLORS["line"])
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Configure>", self._queue_render)
 
@@ -154,17 +198,23 @@ class ObserverApp:
         self._compact_metric(totals, "标旗", self.total_flagged_text, COLORS["mine"])
         ttk.Button(sidebar, text="清除统计", command=self.clear_statistics).pack(fill="x", pady=(0, 7))
         ttk.Separator(sidebar).pack(fill="x", pady=(0, 7))
-        ttk.Label(sidebar, text="当前网格", style="Caption.TLabel").pack(anchor="w")
+        ttk.Label(sidebar, text="当前棋盘", style="Caption.TLabel").pack(anchor="w")
         ttk.Label(sidebar, textvariable=self.geometry_text, style="Caption.TLabel", wraplength=175).pack(anchor="w", pady=(3, 7))
-        ttk.Label(sidebar, text="蓝框安全 · 红框待标雷 · 绿框确认雷", style="Caption.TLabel", wraplength=175).pack(anchor="w")
+        ttk.Label(
+            sidebar,
+            text="蓝框=安全 · 红框=待标雷 · 绿框=画面确认雷\n金框=宝箱 · 深红=已开雷 · 紫框=未识别",
+            style="Caption.TLabel",
+            wraplength=175,
+            justify="left",
+        ).pack(anchor="w")
 
         controls = ttk.Frame(sidebar_shell, style="Sidebar.TFrame", padding=(10, 7))
         controls.pack(fill="x", side="bottom")
         self.advice_label = tk.Label(
             sidebar,
             textvariable=self.advice,
-            bg="#FFF0CF",
-            fg="#9C2E25",
+            bg="#3A2F14",
+            fg="#FFD479",
             font=("Microsoft YaHei UI", 8, "bold"),
             justify="left",
             wraplength=185,
@@ -175,12 +225,13 @@ class ObserverApp:
         self.primary_row.pack(fill="x", pady=(0, 4))
         self.start_button = tk.Button(
             self.primary_row,
-            text="开始自动运行",
+            text="开始自动扫雷",
             command=self.start_automatic,
             bg=COLORS["pine"],
             fg="white",
-            activebackground="#34715E",
+            activebackground=COLORS["pine_hover"],
             activeforeground="white",
+            disabledforeground=COLORS["muted"],
             relief="flat",
             font=("Microsoft YaHei UI", 8, "bold"),
             pady=3,
@@ -191,9 +242,9 @@ class ObserverApp:
         self.pause_button.pack(side="left", fill="x", expand=True, padx=(3, 0))
         action_row = ttk.Frame(controls, style="Sidebar.TFrame")
         action_row.pack(fill="x", pady=(0, 4))
-        self.step_button = ttk.Button(action_row, text="执行一批", command=self.run_single_batch)
+        self.step_button = ttk.Button(action_row, text="执行一轮", command=self.run_single_batch)
         self.step_button.pack(side="left", fill="x", expand=True, padx=(0, 3))
-        self.refresh_button = ttk.Button(action_row, text="重新读取", command=self.refresh)
+        self.refresh_button = ttk.Button(action_row, text="刷新画面", command=self.refresh)
         self.refresh_button.pack(side="left", fill="x", expand=True, padx=(3, 0))
         utility_row = ttk.Frame(controls, style="Sidebar.TFrame")
         utility_row.pack(fill="x")
@@ -204,7 +255,7 @@ class ObserverApp:
             command=self._schedule,
         )
         self.auto_refresh_check.pack(side="left")
-        ttk.Label(utility_row, text="F8 急停", style="Caption.TLabel").pack(side="right")
+        ttk.Label(utility_row, text="F8 启动/急停", style="Caption.TLabel").pack(side="right")
         # Pack the fixed controls before the expanding information pane so the
         # packer never clips buttons when the window is short.
         controls.pack_forget()
@@ -215,6 +266,22 @@ class ObserverApp:
         footer = ttk.Frame(shell)
         footer.pack(fill="x", pady=(6, 0))
         ttk.Label(footer, textvariable=self.status, foreground=COLORS["muted"]).pack(side="left")
+        github_link = tk.Label(
+            footer,
+            text="GitHub：letsminesweeper-bot",
+            bg=COLORS["snow"],
+            fg=COLORS["link"],
+            font=("Microsoft YaHei UI", 8, "underline"),
+            cursor="hand2",
+        )
+        github_link.pack(side="right")
+        github_link.bind("<Button-1>", self._open_github)
+
+    def _open_github(self, _event: object | None = None) -> None:
+        try:
+            webbrowser.open(GITHUB_URL)
+        except OSError:
+            self.status.set(f"无法打开浏览器，仓库地址：{GITHUB_URL}")
 
     def _metric(self, parent: ttk.Frame, label: str, variable: tk.StringVar, color: str) -> None:
         block = ttk.Frame(parent, style="Sidebar.TFrame")
@@ -262,7 +329,7 @@ class ObserverApp:
 
     def clear_statistics(self) -> None:
         self._show_statistics(self.statistics.clear())
-        self.status.set("累计开格和标旗统计已清零")
+        self.status.set("累计统计已清零")
 
     def refresh(self) -> None:
         if self.worker is not None and self.worker.is_alive():
@@ -272,7 +339,7 @@ class ObserverApp:
         if self.refresh_job is not None:
             self.root.after_cancel(self.refresh_job)
             self.refresh_job = None
-        self.status.set("正在后台读取画面…")
+        self.status.set("正在读取游戏画面…")
         self.refresh_thread = threading.Thread(target=self._refresh_worker, daemon=True)
         self.refresh_thread.start()
 
@@ -366,7 +433,7 @@ class ObserverApp:
             self.countdown_job = self.root.after(1000, lambda: self._countdown(remaining - 1))
             return
         self.countdown_job = None
-        self.mode_text.set("自动运行")
+        self.mode_text.set("自动扫雷中")
         self._launch_when_refresh_idle(True)
 
     def run_single_batch(self) -> None:
@@ -376,7 +443,7 @@ class ObserverApp:
         self.stop_event.clear()
         self.advice.set("")
         self.automation = LocalAutomation(observer=WindowObserver(), statistics=self.statistics)
-        self.mode_text.set("执行一批")
+        self.mode_text.set("手动执行一轮")
         self.start_button.configure(state="disabled")
         self.step_button.configure(state="disabled")
         self.root.after(50, lambda: self._launch_when_refresh_idle(False))
@@ -386,10 +453,10 @@ class ObserverApp:
             self._set_idle("已取消启动")
             return
         if self.refresh_thread is not None and self.refresh_thread.is_alive():
-            self.status.set("等待后台读取完成后启动…")
+            self.status.set("等待画面读取完成后启动…")
             self.root.after(50, lambda: self._launch_when_refresh_idle(continuous))
             return
-        self.status.set("正在批量处理当前视口" if continuous else "正在执行当前批次")
+        self.status.set("自动扫雷进行中" if continuous else "正在执行一轮操作")
         self.root.after(30, lambda: self._launch_worker(continuous))
 
     def _launch_worker(self, continuous: bool) -> None:
@@ -460,15 +527,15 @@ class ObserverApp:
         elif pending_refresh is not None:
             self._apply_observation(pending_refresh)
             if pending_refresh.result.contradictions:
-                self.status.set("识别存在矛盾，已停止给出建议")
+                self.status.set("画面识别有矛盾，已暂停建议")
             elif pending_refresh.frame.used_visible_screen_fallback:
-                self.status.set("读取完成；游戏必须保持可见")
+                self.status.set("读取完成；请保持游戏窗口可见")
             else:
                 self.status.set("读取完成")
         if pending_error is not None:
             self.status.set(str(pending_error))
             if self.worker is not None:
-                self.mode_text.set("安全停机")
+                self.mode_text.set("已停止")
         if stopped:
             self.worker = None
             self._set_idle(self.status.get())
@@ -477,9 +544,17 @@ class ObserverApp:
         self.root.after(50, self._poll_events)
 
     def _poll_emergency(self) -> None:
-        if emergency_pressed() and self.mode_text.get() != "观察":
-            self.pause_automatic()
-            self.status.set("F8 紧急停止已触发")
+        pressed = emergency_pressed()
+        # React on the press edge only: the key stays down for a few poll
+        # cycles, and F8 now both starts and stops the run.
+        if pressed and not self._f8_was_down:
+            if self.mode_text.get() == "观察":
+                self.status.set("F8 触发启动")
+                self.start_automatic()
+            else:
+                self.pause_automatic()
+                self.status.set("F8 紧急停止已触发")
+        self._f8_was_down = pressed
         self.root.after(100, self._poll_emergency)
 
     def _set_idle(self, message: str) -> None:

@@ -15,6 +15,7 @@ from minesweeper.automation import (
     ActionKind,
     LocalAutomation,
     LocalNavigator,
+    PlannedAction,
     closed_ratio,
     interior_closed_island,
     plan_action,
@@ -623,7 +624,7 @@ class ReplayTests(unittest.TestCase):
         self.assertLessEqual(closed_ratio(view), 0.30)
         self.assertEqual(LocalNavigator().choose_direction(view), "right")
 
-    def test_small_center_closed_island_is_not_orbited(self) -> None:
+    def test_center_closed_island_triggers_escape_directly(self) -> None:
         source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
         rows = len(source.grid)
         columns = len(source.grid[0])
@@ -651,10 +652,15 @@ class ReplayTests(unittest.TestCase):
         ]
         view = replace(source, grid=grid, result=SolveResult(frozenset(), frozenset(), tuple(), tuple()))
         self.assertIsNotNone(interior_closed_island(view))
-        navigator = LocalNavigator()
-        actions = [plan_drag(view, navigator) for _ in range(4)]
-        self.assertTrue(all(action.navigation_mode == "island_escape" for action in actions))
-        self.assertEqual(len({action.direction for action in actions}), 1)
+        automation = LocalAutomation(observer=None, controller=None)
+        automation.rng = _FixedRandom("up")
+        action = plan_drag(view, automation.navigator)
+        action, note = automation._apply_escape_or_record(view, action)
+        self.assertEqual(action.direction, "up")
+        self.assertEqual(automation.escape_direction, "up")
+        self.assertEqual(automation.escape_moves_done, 1)
+        self.assertIn("中央孤立未开区", note)
+        self.assertIn("脱困移动", note)
 
     def test_small_closed_region_touching_edge_is_not_a_center_island(self) -> None:
         source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
@@ -1306,6 +1312,154 @@ class ChestFlowTests(unittest.TestCase):
         self.assertEqual(automation.chest_failures, automation.MAX_CHEST_FAILURES)
         # The cycle still works normally on the same observation.
         self.assertEqual(outcome.action.kind, ActionKind.BATCH)
+
+
+class _FixedRandom:
+    """Deterministic stand-in for random.Random in escape tests."""
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def choice(self, seq):
+        return self.value
+
+
+class EscapeTests(unittest.TestCase):
+    @staticmethod
+    def _drag_view():
+        source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        return replace(source, result=SolveResult(frozenset(), frozenset(), tuple(), tuple()))
+
+    @staticmethod
+    def _drag_action(direction: str) -> PlannedAction:
+        return PlannedAction(
+            ActionKind.DRAG,
+            direction=direction,
+            drag_start=(0, 0),
+            drag_end=(10, 10),
+        )
+
+    def test_stuck_pattern_detection(self) -> None:
+        automation = LocalAutomation(observer=None, controller=None)
+        self.assertIsNone(automation._stuck_pattern())
+        # Fewer than eight alternating moves never triggers.
+        automation.recent_drag_directions.extend(["up", "down", "up", "down"])
+        self.assertIsNone(automation._stuck_pattern())
+        automation.recent_drag_directions.extend(["up", "down", "up", "down"])
+        self.assertEqual(automation._stuck_pattern(), "oscillation")
+        automation.recent_drag_directions.clear()
+        automation.recent_drag_directions.extend(["up", "left", "down", "right"])
+        self.assertEqual(automation._stuck_pattern(), "rotation")
+        automation.recent_drag_directions.clear()
+        automation.recent_drag_directions.extend(["down", "left", "up", "right"])
+        self.assertEqual(automation._stuck_pattern(), "rotation")
+        automation.recent_drag_directions.clear()
+        automation.recent_drag_directions.extend(["up", "right", "down", "left"])
+        self.assertEqual(automation._stuck_pattern(), "rotation")
+        automation.recent_drag_directions.clear()
+        automation.recent_drag_directions.extend(["up", "up", "down", "down"])
+        self.assertIsNone(automation._stuck_pattern())
+        automation.recent_drag_directions.clear()
+        automation.recent_drag_directions.extend(["up", "down", "up", "left"])
+        self.assertIsNone(automation._stuck_pattern())
+
+    def test_oscillation_triggers_escape_burst_of_eight(self) -> None:
+        view = self._drag_view()
+        automation = LocalAutomation(observer=None, controller=None)
+        automation.rng = _FixedRandom("left")
+        automation.recent_drag_directions.extend(["up", "down", "up", "down", "up", "down", "up"])
+        action, note = automation._apply_escape_or_record(view, self._drag_action("down"))
+        self.assertEqual(action.direction, "left")
+        self.assertEqual(automation.escape_direction, "left")
+        self.assertEqual(automation.escape_moves_done, 1)
+        self.assertIn("方向往复振荡", note)
+        self.assertIn("1/8", note)
+        for _ in range(7):
+            action, note = automation._apply_escape_or_record(view, self._drag_action("left"))
+            self.assertEqual(action.direction, "left")
+        self.assertIn("脱困移动完成", note)
+        self.assertIsNone(automation.escape_direction)
+        self.assertEqual(automation.escape_moves_done, 0)
+        self.assertEqual(len(automation.recent_drag_directions), 0)
+
+    def test_rotation_triggers_escape_burst(self) -> None:
+        view = self._drag_view()
+        automation = LocalAutomation(observer=None, controller=None)
+        automation.rng = _FixedRandom("right")
+        automation.recent_drag_directions.extend(["down", "left", "up"])
+        action, note = automation._apply_escape_or_record(view, self._drag_action("right"))
+        self.assertEqual(automation._stuck_pattern(), "rotation")
+        self.assertEqual(action.direction, "right")
+        self.assertEqual(automation.escape_direction, "right")
+        self.assertIn("方向绕圈旋转", note)
+        self.assertIn("1/8", note)
+
+    def test_perform_cycle_runs_eight_forced_escape_drags(self) -> None:
+        source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        empty_grid = [
+            [replace(cell, kind=CellKind.OPEN, number=0, confidence=1.0) for cell in row]
+            for row in source.grid
+        ]
+        empty = replace(
+            source,
+            grid=empty_grid,
+            result=SolveResult(frozenset(), frozenset(), tuple(), tuple()),
+        )
+
+        class FakeObserver:
+            def __call__(self):
+                return empty
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return empty
+
+        class FakeController:
+            def activate_target(self):
+                return 1, empty.frame.window_rect
+
+            def drag(self, *args: object, **kwargs: object) -> None:
+                return None
+
+        automation = LocalAutomation(observer=FakeObserver(), controller=FakeController())
+        automation.escape_direction = "left"
+        outcomes = [automation.perform_cycle(threading.Event()) for _ in range(8)]
+        self.assertTrue(all(outcome.action.kind == ActionKind.DRAG for outcome in outcomes))
+        self.assertTrue(all(outcome.action.direction == "left" for outcome in outcomes))
+        self.assertIn("脱困移动完成", outcomes[7].message)
+        self.assertIsNone(automation.escape_direction)
+        ninth = automation.perform_cycle(threading.Event())
+        self.assertNotIn("脱困", ninth.message)
+
+    def test_batch_breaks_escape_and_direction_history(self) -> None:
+        batch_view = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        other = observe_image(Image.open(ROOT / "samples" / "chest-raw.png"))
+
+        class FakeObserver:
+            def __call__(self):
+                return batch_view
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return other
+
+        class FakeController:
+            def activate_target(self):
+                return 1, batch_view.frame.window_rect
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                return BatchExecution(flagged=len(points.marks), opened=len(points.safe))
+
+            def drag(self, *args: object, **kwargs: object) -> None:
+                return None
+
+        automation = LocalAutomation(observer=FakeObserver(), controller=FakeController())
+        automation.escape_direction = "up"
+        automation.escape_moves_done = 2
+        automation.recent_drag_directions.extend(["up", "down", "up", "down"])
+        outcome = automation.perform_cycle(threading.Event())
+        self.assertEqual(outcome.action.kind, ActionKind.BATCH)
+        self.assertIsNone(automation.escape_direction)
+        self.assertEqual(automation.escape_moves_done, 0)
+        self.assertEqual(len(automation.recent_drag_directions), 0)
 
 
 if __name__ == "__main__":

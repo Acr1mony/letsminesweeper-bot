@@ -17,3 +17,7 @@ data/statistics.json.tmp
 Thumbs.db
 Desktop.ini
 
+
+build/
+dist/
+*.spec
