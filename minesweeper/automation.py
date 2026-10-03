@@ -470,7 +470,12 @@ class LocalAutomation:
     # Welfare/reward dialogs after clicking a closed chest.
     CHEST_DIALOG_TIMEOUT = 8.0
     CHEST_POLL_INTERVAL = 0.25
+    CHEST_FLOW_TIMEOUT = 15.0
     MAX_CHEST_FAILURES = 3
+    # Dialog dismissal: settle pop-in animations before clicking, then verify
+    # the dialog actually closed and retry when a click lands short.
+    DISMISS_SETTLE_SECONDS = 0.3
+    MAX_DISMISS_CLICKS = 3
 
     def __init__(
         self,
@@ -881,8 +886,10 @@ class LocalAutomation:
         rect: tuple[int, int, int, int],
         center: tuple[int, int],
     ) -> bool:
-        """Click a closed chest cell, then dismiss the welfare and reward
-        dialogs. Returns False when the expected dialogs never appear."""
+        """Click a closed chest cell, then dismiss every reward dialog.
+
+        Returns False when the expected dialogs never appear or a dialog
+        survives the dismissal retries."""
         self.controller.click_batch(
             rect,
             BatchPoints(marks=(), safe=(center,)),
@@ -890,10 +897,34 @@ class LocalAutomation:
         )
         if not self._wait_for_modal(stop_event, self.CHEST_DIALOG_TIMEOUT):
             return False
-        self._dismiss_modals(stop_event)
-        if self._wait_for_modal(stop_event, self.CHEST_DIALOG_TIMEOUT):
-            self._dismiss_modals(stop_event)
-        return True
+        return self._dismiss_until_gone(stop_event, self.CHEST_FLOW_TIMEOUT)
+
+    def _dismiss_until_gone(self, stop_event: threading.Event, timeout: float) -> bool:
+        """Click whatever modal is on screen until it really closes.
+
+        Every click is verified: the dialog must disappear (or hand over to
+        the next one) before the flow reports success, so a click that lands
+        short is retried instead of leaving the bot sweeping behind a modal."""
+        deadline = time.monotonic() + timeout
+        clicks = 0
+        while not stop_event.is_set() and clicks < self.MAX_DISMISS_CLICKS:
+            captured = self._fresh_image()
+            if captured is None:
+                return False
+            if not self._modal_present(captured[1]):
+                return True
+            # Let pop-in animations settle before measuring the click point.
+            if stop_event.wait(self.DISMISS_SETTLE_SECONDS):
+                return False
+            if not self._dismiss_modals(stop_event):
+                if stop_event.wait(self.CHEST_POLL_INTERVAL):
+                    return False
+                continue
+            clicks += 1
+            if stop_event.wait(self.DISMISS_SETTLE_SECONDS):
+                return False
+        captured = self._fresh_image()
+        return captured is not None and not self._modal_present(captured[1])
 
     def _closed_chest_center(self, observation: Observation) -> tuple[int, int] | None:
         candidates = [

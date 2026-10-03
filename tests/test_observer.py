@@ -1159,10 +1159,18 @@ class ChestFlowTests(unittest.TestCase):
     def test_open_closed_chest_clicks_cell_then_both_confirms(self) -> None:
         welfare_image = self._image("welfare-chest-dialog.png")
         reward_image = self._image("chest-reward-dialog.png")
+        clean_image = self._image("initial.png")
 
         class FakeObserver:
             def __init__(self) -> None:
-                self.frames = [welfare_image, welfare_image, reward_image, reward_image]
+                self.frames = [
+                    welfare_image,
+                    welfare_image,
+                    welfare_image,
+                    reward_image,
+                    reward_image,
+                    clean_image,
+                ]
 
             def raw_frame(self) -> CaptureFrame:
                 return ChestFlowTests._frame(
@@ -1179,6 +1187,7 @@ class ChestFlowTests(unittest.TestCase):
 
         controller = FakeController()
         automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        automation.DISMISS_SETTLE_SECONDS = 0.0
         handled = automation._open_closed_chest(
             threading.Event(),
             (0, 0, 708, 454),
@@ -1192,6 +1201,47 @@ class ChestFlowTests(unittest.TestCase):
         self.assertAlmostEqual(controller.clicks[2][0], 353, delta=6)
         self.assertAlmostEqual(controller.clicks[2][1], 282, delta=6)
         self.assertIn("宝箱奖励", automation.recovery_note or "")
+
+    def test_dismiss_retries_when_a_click_misses(self) -> None:
+        welfare_image = self._image("welfare-chest-dialog.png")
+        clean_image = self._image("initial.png")
+
+        class FakeObserver:
+            def __init__(self) -> None:
+                self.frames = [
+                    welfare_image,
+                    welfare_image,
+                    welfare_image,
+                    welfare_image,
+                    clean_image,
+                    clean_image,
+                ]
+                self.amber_clicks = 0
+
+            def raw_frame(self) -> CaptureFrame:
+                return ChestFlowTests._frame(
+                    self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
+                )
+
+        class FakeController:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[int, int]] = []
+
+            def click_batch(self, _rect, points, _stop_event) -> BatchExecution:
+                self.clicks.extend(points.safe)
+                return BatchExecution(flagged=0, opened=len(points.safe))
+
+        controller = FakeController()
+        automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        automation.DISMISS_SETTLE_SECONDS = 0.0
+        handled = automation._dismiss_until_gone(threading.Event(), 15.0)
+        self.assertTrue(handled)
+        # First click missed (dialog still up), the retry lands and the flow
+        # only reports success after the dialog is verified gone.
+        self.assertEqual(len(controller.clicks), 2)
+        for click in controller.clicks:
+            self.assertAlmostEqual(click[0], 352, delta=6)
+            self.assertAlmostEqual(click[1], 348, delta=6)
 
     def test_chest_flow_fails_without_dialog(self) -> None:
         normal_image = self._image("initial.png")
@@ -1223,6 +1273,7 @@ class ChestFlowTests(unittest.TestCase):
         other = observe_image(self._image("initial.png"))
         welfare_image = self._image("welfare-chest-dialog.png")
         reward_image = self._image("chest-reward-dialog.png")
+        clean_image = self._image("chest-raw.png")
 
         class FakeObserver:
             def __init__(self) -> None:
@@ -1231,8 +1282,10 @@ class ChestFlowTests(unittest.TestCase):
                     [
                         ChestFlowTests._frame(welfare_image),
                         ChestFlowTests._frame(welfare_image),
+                        ChestFlowTests._frame(welfare_image),
                         ChestFlowTests._frame(reward_image),
                         ChestFlowTests._frame(reward_image),
+                        ChestFlowTests._frame(clean_image),
                     ]
                 )
 
@@ -1262,6 +1315,7 @@ class ChestFlowTests(unittest.TestCase):
 
         controller = FakeController()
         automation = LocalAutomation(observer=FakeObserver(), controller=controller)
+        automation.DISMISS_SETTLE_SECONDS = 0.0
         outcome = automation.perform_cycle(threading.Event())
         self.assertEqual(outcome.action.kind, ActionKind.BATCH)
         self.assertGreaterEqual(len(controller.clicks), 3)
