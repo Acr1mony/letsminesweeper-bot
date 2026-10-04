@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import cv2
 import numpy as np
 
 # Reference colours sampled from the game's own dialog screenshots.
@@ -97,9 +98,10 @@ def detect_revive_button(image_rgb: np.ndarray) -> tuple[int, int] | None:
 def detect_welfare_confirm(image_rgb: np.ndarray) -> tuple[int, int] | None:
     """Window coordinate of the amber 确认 button on the welfare dialog.
 
-    Reward badges on the dialog also contain amber pixels, so the search
-    walks up from the bottom-most solid amber row; the button is the lowest
-    wide bar and sits clearly below the badges."""
+    The button is the lowest large amber component in the lower-central
+    band. Connected-component analysis keeps it whole even where the 确认
+    label punches text-shaped holes through the amber; reward badges above
+    are smaller and board chests far narrower, so both fail the size filter."""
     height, width = image_rgb.shape[:2]
     y0, y1 = int(height * 0.55), int(height * 0.92)
     x0, x1 = int(width * 0.25), int(width * 0.75)
@@ -107,25 +109,24 @@ def detect_welfare_confirm(image_rgb: np.ndarray) -> tuple[int, int] | None:
     if region.size == 0:
         return None
     red, green, blue = _channels(region)
-    mask = (red > 200) & (green > 130) & (green < 220) & (blue < 120) & (red > blue + 90)
-    rows = mask.sum(axis=1)
-    solid = rows >= 30
-    if not solid.any():
+    mask = (
+        (red > 200) & (green > 130) & (green < 220) & (blue < 120) & (red > blue + 90)
+    ).astype(np.uint8)
+    if int(mask.sum()) < _MIN_WELFARE_PIXELS:
         return None
-    bottom = int(np.nonzero(solid)[0].max())
-    top = bottom
-    while top > 0 and solid[top - 1]:
-        top -= 1
-    cluster = mask[top : bottom + 1]
-    count = int(cluster.sum())
-    if count < _MIN_WELFARE_PIXELS:
-        return None
-    ys, xs = np.nonzero(cluster)
-    box_width = int(xs.max()) - int(xs.min()) + 1
-    box_height = bottom - top + 1
-    if not (60 <= box_width <= 220 and 14 <= box_height <= 60):
-        return None
-    return (
-        x0 + round(float(np.mean(xs))),
-        y0 + top + round(float(np.mean(ys))),
-    )
+    num, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    best: tuple[int, int] | None = None
+    best_bottom = -1
+    for index in range(1, num):
+        x, y, w, h, area = (int(value) for value in stats[index])
+        if area < 500 or not (60 <= w <= 220 and 14 <= h <= 60):
+            continue
+        if area < 0.35 * w * h:
+            continue
+        if y + h > best_bottom:
+            best_bottom = y + h
+            best = (
+                x0 + round(float(centroids[index][0])),
+                y0 + round(float(centroids[index][1])),
+            )
+    return best

@@ -939,6 +939,18 @@ class DialogTests(unittest.TestCase):
         self.assertEqual([(cell.variant) for cell in closed_cells], ["closed"])
         self.assertEqual([(cell.variant) for cell in opened_cells], ["open"])
 
+    def test_live_welfare_dialog_frame_is_detected(self) -> None:
+        # Regression: the real in-game dialog (thicker 确认 label) once broke
+        # the row-threshold amber walk and left the bot stuck behind it.
+        array = np.array(Image.open(ROOT / "samples" / "live-dialog-01.png").convert("RGB"))
+        self.assertTrue(detect_cyan_dialog(array))
+        self.assertFalse(detect_death_dialog(array))
+        confirm = detect_welfare_confirm(array)
+        self.assertIsNotNone(confirm)
+        assert confirm is not None
+        self.assertAlmostEqual(confirm[0], 361, delta=6)
+        self.assertAlmostEqual(confirm[1], 332, delta=6)
+
     def test_dismiss_modals_clicks_welfare_confirm(self) -> None:
         welfare_image = Image.fromarray(self._sample_array("welfare-chest-dialog.png"))
 
