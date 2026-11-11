@@ -21,3 +21,8 @@ Desktop.ini
 build/
 dist/
 *.spec
+
+tools/_game_assets/
+tools/_sheets/
+tools/_sheets_*.json
+tools/_game_*.py

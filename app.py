@@ -283,16 +283,6 @@ class ObserverApp:
         except OSError:
             self.status.set(f"无法打开浏览器，仓库地址：{GITHUB_URL}")
 
-    def _metric(self, parent: ttk.Frame, label: str, variable: tk.StringVar, color: str) -> None:
-        block = ttk.Frame(parent, style="Sidebar.TFrame")
-        block.pack(fill="x", pady=(0, 13))
-        marker = tk.Frame(block, bg=color, width=5, height=45)
-        marker.pack(side="left", fill="y", padx=(0, 12))
-        text = ttk.Frame(block, style="Sidebar.TFrame")
-        text.pack(side="left", fill="x")
-        ttk.Label(text, text=label, style="Caption.TLabel").pack(anchor="w")
-        ttk.Label(text, textvariable=variable, style="Metric.TLabel").pack(anchor="w")
-
     def _compact_metric(
         self,
         parent: ttk.Frame,

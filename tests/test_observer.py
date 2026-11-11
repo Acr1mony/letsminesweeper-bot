@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from minesweeper.automation import (
     ActionKind,
@@ -23,6 +23,7 @@ from minesweeper.automation import (
     recognition_issue,
 )
 from minesweeper.capture import CaptureFrame
+from minesweeper.geometry import detect_grid
 from minesweeper.input_control import BatchExecution, WindowInputController
 from minesweeper.observer import WindowObserver, board_motion_ratio, observe_image
 from minesweeper.recognition import Cell, CellKind, classify_cell
@@ -68,6 +69,46 @@ class RecognitionTests(unittest.TestCase):
     def test_open_tile_is_not_a_mine(self) -> None:
         tile = np.full((33, 33, 3), 240, dtype=np.uint8)
         self.assertEqual(classify_cell(tile, 0, 0).kind, CellKind.OPEN)
+
+    def test_small_flag_marker_is_a_mine_not_a_closed_tile(self) -> None:
+        # A flag skin leaves ~84% of the tile gray. Reading that as CLOSED would
+        # let the bot right-click the mark away and later walk onto the mine.
+        tile = np.full((33, 33, 3), 169, dtype=np.uint8)
+        tile[7:17, 12:19] = (200, 40, 40)
+        tile[17:25, 14:16] = (120, 90, 60)
+        self.assertEqual(classify_cell(tile, 0, 0).kind, CellKind.MINE_MARK)
+
+    def test_marker_skin_covering_the_centre_is_still_a_mine(self) -> None:
+        # Large skins leave almost no gray in the middle, so only the intact
+        # bevel around them proves the tile was never opened.
+        tile = np.full((33, 33, 3), 169, dtype=np.uint8)
+        tile[4:28, 4:28] = (229, 60, 90)
+        self.assertEqual(classify_cell(tile, 0, 0).kind, CellKind.MINE_MARK)
+
+    def test_digits_seven_and_eight_are_recognised(self) -> None:
+        # Colors taken from the game's own number sprites, so 7 and 8 no longer
+        # degrade into unrecognized cells (which stalled the whole cycle).
+        for number, color in ((7, (51, 50, 50)), (8, (120, 120, 131))):
+            with self.subTest(number=number):
+                tile = np.full((33, 33, 3), 240, dtype=np.uint8)
+                tile[9:22, 12:17] = color
+                tile[9:13, 12:23] = color
+                cell = classify_cell(tile, 0, 0)
+                self.assertEqual(cell.kind, CellKind.NUMBER)
+                self.assertEqual(cell.number, number)
+
+    def test_small_pitch_digit_strokes_survive_antialiasing(self) -> None:
+        # An 8px stroke shrunk to a 28px pitch keeps only 0.05 of its core color
+        # at a tolerance of 8, less than the 0.055 threshold, so the tolerance
+        # has to absorb the blended edge pixels.
+        glyph = Image.new("RGB", (84, 84), (240, 240, 240))
+        draw = ImageDraw.Draw(glyph)
+        draw.rectangle([38, 12, 46, 72], fill=(57, 51, 167))
+        draw.rectangle([20, 12, 64, 20], fill=(57, 51, 167))
+        small = np.array(glyph.resize((28, 28), Image.LANCZOS))
+        cell = classify_cell(small, 0, 0)
+        self.assertEqual(cell.kind, CellKind.NUMBER)
+        self.assertEqual(cell.number, 4)
 
     def test_click_timing_defaults_favor_reliable_input(self) -> None:
         controller = WindowInputController()
@@ -1398,6 +1439,54 @@ class EscapeTests(unittest.TestCase):
         return replace(source, result=SolveResult(frozenset(), frozenset(), tuple(), tuple()))
 
     @staticmethod
+    def _band_view(side: str):
+        """Synthetic view whose only CLOSED cells sit inside one edge band."""
+        source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        rows = len(source.grid)
+        columns = len(source.grid[0])
+        band = max(2, min(3, min(rows, columns) // 4))
+
+        def is_closed(row: int, column: int) -> bool:
+            if side == "left":
+                return column < band
+            if side == "right":
+                return column >= columns - band
+            if side == "up":
+                return row < band
+            return row >= rows - band
+
+        grid = [
+            [
+                replace(
+                    cell,
+                    kind=CellKind.CLOSED if is_closed(row, column) else CellKind.OPEN,
+                    number=None if is_closed(row, column) else 0,
+                    confidence=1.0,
+                )
+                for column, cell in enumerate(source_row)
+            ]
+            for row, source_row in enumerate(source.grid)
+        ]
+        return replace(
+            source,
+            grid=grid,
+            result=SolveResult(frozenset(), frozenset(), tuple(), tuple()),
+        )
+
+    @staticmethod
+    def _empty_view():
+        source = observe_image(Image.open(ROOT / "samples" / "initial.png"))
+        grid = [
+            [replace(cell, kind=CellKind.OPEN, number=0, confidence=1.0) for cell in row]
+            for row in source.grid
+        ]
+        return replace(
+            source,
+            grid=grid,
+            result=SolveResult(frozenset(), frozenset(), tuple(), tuple()),
+        )
+
+    @staticmethod
     def _drag_action(direction: str) -> PlannedAction:
         return PlannedAction(
             ActionKind.DRAG,
@@ -1474,11 +1563,21 @@ class EscapeTests(unittest.TestCase):
         )
 
         class FakeObserver:
+            """Each drag really moves the board, so the burst is not aborted."""
+
+            cycles = 0
+
+            def _view(self):
+                FakeObserver.cycles += 1
+                tag = "a" if FakeObserver.cycles % 2 else "b"
+                grid = [[replace(cell, variant=tag) for cell in row] for row in empty_grid]
+                return replace(empty, grid=grid)
+
             def __call__(self):
-                return empty
+                return self._view()
 
             def wait_for_stable(self, *args: object, **kwargs: object):
-                return empty
+                return self._view()
 
         class FakeController:
             def activate_target(self):
@@ -1494,8 +1593,134 @@ class EscapeTests(unittest.TestCase):
         self.assertTrue(all(outcome.action.direction == "left" for outcome in outcomes))
         self.assertIn("脱困移动完成", outcomes[7].message)
         self.assertIsNone(automation.escape_direction)
+        # The finished burst leaves a commitment: keep heading away from it.
+        self.assertEqual(automation.navigator.commit_direction, "left")
+        self.assertEqual(automation.navigator.commit_left, automation.ESCAPE_COMMIT_MOVES)
         ninth = automation.perform_cycle(threading.Event())
         self.assertNotIn("脱困", ninth.message)
+
+    def test_escape_direction_is_scored_instead_of_random(self) -> None:
+        view = self._band_view("left")
+        automation = LocalAutomation(observer=None, controller=None)
+        automation.recent_drag_directions.extend(
+            ["up", "down", "up", "down", "up", "down", "up"]
+        )
+        action, note = automation._apply_escape_or_record(view, self._drag_action("down"))
+        # The only closed band is on the left, so that is the scored choice;
+        # random tie-breaking is not allowed to send the viewport elsewhere.
+        self.assertEqual(automation.escape_direction, "left")
+        self.assertEqual(action.direction, "left")
+        self.assertIn("1/8", note)
+
+    def test_escape_direction_skips_blocked_and_previous_axis(self) -> None:
+        navigator = LocalNavigator()
+        self.assertEqual(navigator.escape_candidates(self._band_view("left")), ["left"])
+        navigator.remember_blocked("left")
+        self.assertNotIn("left", navigator.escape_candidates(self._band_view("left")))
+        fresh = LocalNavigator()
+        self.assertNotIn(
+            "right",
+            fresh.escape_candidates(self._band_view("right"), {"right", "left"}),
+        )
+
+    def test_blocked_direction_is_not_repeated(self) -> None:
+        view = self._band_view("left")
+        self.assertEqual(LocalNavigator().choose_direction(view), "left")
+        navigator = LocalNavigator()
+        navigator.remember_blocked("left")
+        self.assertNotEqual(navigator.choose_direction(view), "left")
+        navigator.clear_blocked("left")
+        self.assertEqual(navigator.choose_direction(view), "left")
+
+    def test_commitment_never_reverses_into_the_escaped_area(self) -> None:
+        for side in ("left", "right", "up", "down"):
+            view = self._band_view(side)
+            navigator = LocalNavigator()
+            navigator.commit_to("right", 4)
+            with self.subTest(side=side):
+                moves = [navigator.choose_direction(view) for _ in range(4)]
+                self.assertNotIn("left", moves)
+                self.assertEqual(navigator.commit_left, 0)
+                self.assertIsNone(navigator.commit_direction)
+
+    def test_commitment_prefers_forward_into_empty_ground(self) -> None:
+        view = self._empty_view()
+        navigator = LocalNavigator()
+        navigator.commit_to("right", 2)
+        self.assertEqual(navigator.choose_direction(view), "right")
+        self.assertEqual(navigator.choose_direction(view), "right")
+        self.assertIsNone(navigator.commit_direction)
+
+    def test_forced_drag_cannot_undo_commitment(self) -> None:
+        view = self._band_view("left")
+        navigator = LocalNavigator()
+        navigator.commit_to("right", 4)
+        action = plan_drag(view, navigator, forced_direction="left")
+        self.assertEqual(action.direction, "right")
+
+    def test_burst_hitting_the_edge_ends_early(self) -> None:
+        view = self._empty_view()
+
+        class FakeObserver:
+            def __call__(self):
+                return view
+
+            def wait_for_stable(self, *args: object, **kwargs: object):
+                return view
+
+        class FakeController:
+            def activate_target(self):
+                return 1, view.frame.window_rect
+
+            def drag(self, *args: object, **kwargs: object) -> None:
+                return None
+
+        automation = LocalAutomation(observer=FakeObserver(), controller=FakeController())
+        automation.escape_direction = "left"
+        automation.escape_moves_done = 2
+        outcome = automation.perform_cycle(threading.Event())
+        self.assertIn("到达边界", outcome.message)
+        self.assertIsNone(automation.escape_direction)
+        self.assertEqual(automation.escape_moves_done, 0)
+        self.assertIn("left", automation.navigator.blocked)
+        self.assertEqual(automation.navigator.commit_direction, "left")
+        self.assertEqual(automation.navigator.commit_left, automation.ESCAPE_COMMIT_MOVES)
+
+    def test_unfittable_drag_falls_back_instead_of_aborting(self) -> None:
+        view = self._band_view("left")
+        automation = LocalAutomation(observer=None, controller=None)
+
+        def stubborn(*args: object, **kwargs: object):
+            raise RuntimeError("当前已打开区域不足以完成安全拖动")
+
+        with patch("minesweeper.automation.plan_drag", stubborn):
+            action = automation._safe_plan_drag(view, "left")
+        self.assertEqual(action.kind, ActionKind.DRAG)
+        self.assertIn("left", automation.navigator.blocked)
+        self.assertIsNone(automation.escape_direction)
+        self.assertEqual(automation.escape_moves_done, 0)
+        self.assertEqual(automation.edge_drags, 1)
+        self.assertIn("盲拖", automation.recovery_note or "")
+
+    def test_unfittable_drag_retries_with_another_direction(self) -> None:
+        view = self._band_view("left")
+        automation = LocalAutomation(observer=None, controller=None)
+        real_plan_drag = plan_drag
+        calls: list[str | None] = []
+
+        def flaky(observation, navigator, forced_direction=None):
+            calls.append(forced_direction)
+            if forced_direction is not None:
+                raise RuntimeError("当前已打开区域不足以完成安全拖动")
+            return real_plan_drag(observation, navigator)
+
+        with patch("minesweeper.automation.plan_drag", flaky):
+            action = automation._safe_plan_drag(view, "left")
+        self.assertEqual(calls, ["left", None])
+        self.assertEqual(action.kind, ActionKind.DRAG)
+        self.assertIn("left", automation.navigator.blocked)
+        self.assertEqual(automation.edge_drags, 1)
+        self.assertIsNone(automation.recovery_note)
 
     def test_batch_breaks_escape_and_direction_history(self) -> None:
         batch_view = observe_image(Image.open(ROOT / "samples" / "initial.png"))
@@ -1612,6 +1837,46 @@ class RecoveryHardeningTests(unittest.TestCase):
         self.assertFalse(calls[0]["drop_pitch_hint"])
         self.assertFalse(calls[1]["drop_pitch_hint"])
         self.assertTrue(all(call["drop_pitch_hint"] for call in calls[2:]))
+
+
+class GeometryTests(unittest.TestCase):
+    """Grid calibration must survive window scaling, not only the default size."""
+
+    def _board(self) -> Image.Image:
+        return Image.open(ROOT / "samples" / "initial.png").convert("RGB")
+
+    def _scaled(self, scale: float) -> np.ndarray:
+        board = self._board()
+        resized = board.resize(
+            (round(board.width * scale), round(board.height * scale)),
+            Image.LANCZOS,
+        )
+        return np.array(resized)
+
+    def test_default_window_scale_is_detected(self) -> None:
+        geometry = detect_grid(np.array(self._board()))
+        self.assertAlmostEqual(geometry.pitch, 33.4, delta=0.5)
+        self.assertEqual(geometry.full_columns, 26)
+        self.assertEqual(geometry.full_rows, 11)
+
+    def test_shrunk_window_is_detected(self) -> None:
+        geometry = detect_grid(self._scaled(0.8))
+        self.assertAlmostEqual(geometry.pitch, 26.75, delta=1.0)
+        self.assertEqual(geometry.full_columns, 26)
+
+    def test_enlarged_window_is_detected(self) -> None:
+        geometry = detect_grid(self._scaled(1.6))
+        self.assertAlmostEqual(geometry.pitch, 53.45, delta=1.5)
+        self.assertEqual(geometry.full_columns, 26)
+
+    def test_doubled_window_keeps_real_cell_size(self) -> None:
+        geometry = detect_grid(self._scaled(2.0))
+        self.assertAlmostEqual(geometry.pitch, 66.8, delta=1.5)
+        self.assertEqual(geometry.full_columns, 26)
+
+    def test_tiny_image_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "游戏窗口过小"):
+            detect_grid(np.zeros((150, 180, 3), dtype=np.uint8))
 
 
 if __name__ == "__main__":

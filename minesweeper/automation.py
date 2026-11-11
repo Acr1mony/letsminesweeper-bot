@@ -201,6 +201,13 @@ class LocalNavigator:
         # kept, so exploration can avoid returning to familiar ground.
         self.position: tuple[float, float] = (0.0, 0.0)
         self.trail: list[tuple[float, float]] = [(0.0, 0.0)]
+        # Escape commitment: after a burst the navigation keeps heading away
+        # from the area it just fled instead of turning straight back into it.
+        self.commit_direction: str | None = None
+        self.commit_left = 0
+        # Directions whose last drag left the viewport untouched (board edge or
+        # a gesture the game ignored); retrying them only wastes cycles.
+        self.blocked: set[str] = set()
 
     def move_viewport(self, row_delta: float, column_delta: float) -> None:
         self.position = (self.position[0] + row_delta, self.position[1] + column_delta)
@@ -240,6 +247,89 @@ class LocalNavigator:
         )
         return alternatives[0], True
 
+    def remember_blocked(self, direction: str) -> None:
+        """Remember that a drag in this direction changed nothing."""
+        self.blocked.add(direction)
+
+    def clear_blocked(self, direction: str | None = None) -> None:
+        if direction is None:
+            self.blocked.clear()
+        else:
+            self.blocked.discard(direction)
+
+    def commit_to(self, direction: str, moves: int) -> None:
+        """Keep moving away from the escaped area for a few more drags."""
+        self.commit_direction = direction
+        self.commit_left = max(0, moves)
+
+    def release_commitment(self) -> None:
+        self.commit_direction = None
+        self.commit_left = 0
+
+    def _committed_direction(self, scores: dict[str, float]) -> str:
+        """Forward first, then a sideways step, never straight back."""
+        forward = self.commit_direction
+        assert forward is not None
+        banned = self.OPPOSITE[forward]
+        index = self.DIRECTIONS.index(forward)
+        sideways = [
+            self.DIRECTIONS[(index + 1) % len(self.DIRECTIONS)],
+            self.DIRECTIONS[(index - 1) % len(self.DIRECTIONS)],
+        ]
+        options = [forward] + sideways
+        available = [
+            item for item in options if item != banned and item not in self.blocked
+        ]
+        if not available:
+            available = [item for item in options if item != banned] or [forward]
+        return max(
+            available,
+            key=lambda item: (
+                scores.get(item, 0.0) > 0.0,
+                scores.get(item, 0.0),
+                item == forward,
+                -self.revisit_count(item),
+            ),
+        )
+
+    def escape_candidates(
+        self,
+        observation: Observation,
+        avoid: set[str] | frozenset[str] = frozenset(),
+    ) -> list[str]:
+        """Best escape directions: unvisited, not blocked, most closed ahead."""
+        grid = observation.grid
+        rows = len(grid)
+        columns = len(grid[0])
+        band = max(2, min(3, min(rows, columns) // 4))
+        counts = {direction: 0 for direction in self.DIRECTIONS}
+        for row in range(rows):
+            for column in range(columns):
+                if grid[row][column].kind != CellKind.CLOSED:
+                    continue
+                if column < band:
+                    counts["left"] += 1
+                if column >= columns - band:
+                    counts["right"] += 1
+                if row < band:
+                    counts["up"] += 1
+                if row >= rows - band:
+                    counts["down"] += 1
+        keys = {
+            direction: (
+                direction in self.blocked,
+                self.revisit_count(direction) > 0,
+                -counts[direction],
+            )
+            for direction in self.DIRECTIONS
+        }
+        ordered = sorted(self.DIRECTIONS, key=lambda item: keys[item])
+        filtered = [item for item in ordered if item not in avoid] or ordered
+        best = keys[filtered[0]]
+        # Only the leading tie group is randomised by the caller, so a blind
+        # choice can no longer send the viewport into explored ground.
+        return [item for item in filtered if keys[item] == best]
+
     def remember(self, signature: str) -> None:
         if signature in self.recent_views:
             self.repeated_views += 1
@@ -267,20 +357,15 @@ class LocalNavigator:
         if visible_closed_direction is not None:
             self.last_closed_direction = visible_closed_direction
         ratio = closed_ratio(observation)
+        # Ratio rescue is only a preference: it must not skip the escape
+        # commitment or the blocked-direction veto below, otherwise "there are
+        # still closed cells on the left" drags the viewport straight back into
+        # the area it just fled.
+        rescue: str | None = None
         if ratio >= 0.70:
-            direction = visible_open_direction or self.last_open_direction
-            if direction is not None:
-                self.rotation = (self.DIRECTIONS.index(direction) + 1) % len(self.DIRECTIONS)
-                self.last_direction = direction
-                self.last_mode = "ratio_rescue"
-                return direction
-        if ratio <= 0.30:
-            direction = visible_closed_direction or self.last_closed_direction
-            if direction is not None:
-                self.rotation = (self.DIRECTIONS.index(direction) + 1) % len(self.DIRECTIONS)
-                self.last_direction = direction
-                self.last_mode = "ratio_rescue"
-                return direction
+            rescue = visible_open_direction or self.last_open_direction
+        elif ratio <= 0.30:
+            rescue = visible_closed_direction or self.last_closed_direction
 
         def closed_count(positions: list[tuple[int, int]]) -> int:
             return sum(grid[row][column].kind == CellKind.CLOSED for row, column in positions)
@@ -314,6 +399,27 @@ class LocalNavigator:
                 "down": float(closed_count([(row, column) for row in range(rows - band, rows) for column in range(columns)])),
             }
 
+        # A direction that just failed to move the viewport is worthless as a
+        # score source; it is only used again when nothing else is left.
+        for blocked_direction in self.blocked:
+            scores[blocked_direction] = 0.0
+
+        if self.commit_left > 0 and self.commit_direction is not None:
+            direction = self._committed_direction(scores)
+            self.commit_left -= 1
+            if self.commit_left <= 0:
+                self.release_commitment()
+            self.rotation = (self.DIRECTIONS.index(direction) + 1) % len(self.DIRECTIONS)
+            self.last_direction = direction
+            self.last_mode = "escape_commit"
+            return direction
+
+        if rescue is not None and rescue not in self.blocked:
+            self.rotation = (self.DIRECTIONS.index(rescue) + 1) % len(self.DIRECTIONS)
+            self.last_direction = rescue
+            self.last_mode = "ratio_rescue"
+            return rescue
+
         if self.last_direction is None:
             order = list(self.DIRECTIONS[self.rotation :] + self.DIRECTIONS[: self.rotation])
             direction = max(order, key=lambda candidate: scores[candidate])
@@ -335,6 +441,19 @@ class LocalNavigator:
             else:
                 direction = reverse
         direction, avoided = self._avoid_revisit(direction, scores)
+        if direction in self.blocked:
+            free = [item for item in self.DIRECTIONS if item not in self.blocked]
+            if free:
+                index = self.DIRECTIONS.index(direction)
+                direction = max(
+                    free,
+                    key=lambda item: (
+                        scores.get(item, 0.0),
+                        -self.revisit_count(item),
+                        (self.DIRECTIONS.index(item) - index) % len(self.DIRECTIONS),
+                    ),
+                )
+                avoided = True
         self.rotation = (self.DIRECTIONS.index(direction) + 1) % len(self.DIRECTIONS)
         self.last_direction = direction
         self.last_mode = "trail" if avoided else ("frontier" if frontier else "density")
@@ -358,11 +477,21 @@ def plan_drag(
     rows = len(observation.grid)
     columns = len(observation.grid[0])
     center = (rows / 2.0, columns / 2.0)
-    direction = forced_direction or navigator.choose_direction(observation)
     if forced_direction is not None:
+        # A forced drag (empty-view probe, recovery) must not undo the escape
+        # commitment by dragging straight back into the area just left.
+        if (
+            navigator.commit_left > 0
+            and navigator.commit_direction is not None
+            and forced_direction == navigator.OPPOSITE[navigator.commit_direction]
+        ):
+            forced_direction = navigator.commit_direction
+        direction = forced_direction
         navigator.last_direction = forced_direction
         navigator.rotation = (navigator.DIRECTIONS.index(forced_direction) + 1) % len(navigator.DIRECTIONS)
         navigator.last_mode = "forced"
+    else:
+        direction = navigator.choose_direction(observation)
     geometry = observation.geometry
     frontier, _ = frontier_analysis(observation)
     # Dragging is a viewport gesture in this game, not a click. Every complete
@@ -463,6 +592,9 @@ class LocalAutomation:
     OSCILLATION_THRESHOLD = 8
     ROTATION_THRESHOLD = 4
     ESCAPE_MOVES = 8
+    # After a burst the bot keeps heading away from the area it fled for a few
+    # more drags; turning straight back would waste the whole burst.
+    ESCAPE_COMMIT_MOVES = 4
     # Stepping on a mine opens a death dialog whose revive button only
     # appears after a six-second countdown, so the wait must exceed it.
     REVIVE_WAIT_SECONDS = 15.0
@@ -500,6 +632,12 @@ class LocalAutomation:
         self.recent_drag_directions: deque[str] = deque(maxlen=self.OSCILLATION_THRESHOLD)
         self.escape_direction: str | None = None
         self.escape_moves_done = 0
+        self.last_escape_direction: str | None = None
+        # True while the current cycle's drag belongs to an escape burst, so a
+        # drag that moves nothing can end the burst instead of burning a move.
+        self.escape_pending = False
+        # Counts fallback pans taken because no drag could fit (board edge).
+        self.edge_drags = 0
         self.rng = random.Random()
 
     @staticmethod
@@ -510,6 +648,7 @@ class LocalAutomation:
 
     def perform_cycle(self, stop_event: threading.Event) -> StepOutcome:
         self.recovery_note = None
+        self.escape_pending = False
         activate_target = getattr(self.controller, "activate_target", None)
         active_rect: tuple[int, int, int, int] | None = None
         if callable(activate_target):
@@ -538,7 +677,12 @@ class LocalAutomation:
             self.last_observation = before
         before_signature = view_signature(before)
         self.navigator.remember(before_signature)
-        action = plan_action(before, self.navigator)
+        try:
+            action = plan_action(before, self.navigator)
+        except RecognitionAnomaly:
+            raise
+        except RuntimeError:
+            action = self._safe_plan_drag(before)
         exploring_empty_view = action.kind == ActionKind.COMPLETE
         forced_last_action_probe = False
         if exploring_empty_view:
@@ -559,7 +703,7 @@ class LocalAutomation:
                 else None
             )
             forced_last_action_probe = forced_direction is not None
-            action = plan_drag(before, self.navigator, forced_direction=forced_direction)
+            action = self._safe_plan_drag(before, forced_direction)
             self.empty_view_drags += 1
         else:
             self.empty_view_drags = 0
@@ -569,10 +713,9 @@ class LocalAutomation:
             action, escape_note = self._apply_escape_or_record(before, action)
         if action.kind == ActionKind.BATCH:
             self.search_started_at = None
-            # Productive work breaks any suspected navigation loop.
-            self.recent_drag_directions.clear()
-            self.escape_direction = None
-            self.escape_moves_done = 0
+            # Productive work breaks any suspected navigation loop, the escape
+            # burst and the commitment that belonged to it.
+            self._clear_escape_state()
             last_position = action.safe[-1] if action.safe else action.marks[-1]
             self.last_action_direction = self._position_direction(before, last_position)
         elif action.kind == ActionKind.DRAG and self.search_started_at is None:
@@ -678,6 +821,11 @@ class LocalAutomation:
         # frontier advice would only mislead while it runs.
         advice = None if exploring_empty_view else self._search_advice()
         if not stop_event.is_set() and after_signature == before_signature:
+            # The drag moved nothing: retrying that direction is pure waste, so
+            # it is remembered as blocked for the next direction decision.
+            self.navigator.remember_blocked(action.direction)
+            if self.escape_pending:
+                return StepOutcome(after, action, 1, self._abort_escape(), advice)
             if forced_last_action_probe:
                 return StepOutcome(
                     after,
@@ -690,6 +838,7 @@ class LocalAutomation:
             message = f"当前方向已到边界，下一步顺时针转向 {next_direction}"
             return StepOutcome(after, action, 1, escape_note or message, advice)
         self.navigator.remember(after_signature)
+        self.navigator.clear_blocked(action.direction)
         pitch = before.geometry.pitch
         self.navigator.move_viewport(
             -(action.drag_end[1] - action.drag_start[1]) / pitch,
@@ -707,9 +856,7 @@ class LocalAutomation:
                 self.empty_view_started_at = None
                 self.search_started_at = None
                 # Closed cells are visible again: the escape has done its job.
-                self.recent_drag_directions.clear()
-                self.escape_direction = None
-                self.escape_moves_done = 0
+                self._clear_escape_state()
                 return StepOutcome(
                     after,
                     action,
@@ -724,7 +871,12 @@ class LocalAutomation:
                 escape_note or self._empty_exploration_message(action),
                 advice,
             )
-        if action.navigation_mode == "trail":
+        if action.navigation_mode == "escape_commit":
+            navigation_message = (
+                f"脱困后继续远离该区域，向{action.direction}移动"
+                f"（剩 {self.navigator.commit_left} 次承诺）"
+            )
+        elif action.navigation_mode == "trail":
             navigation_message = f"该方向区域已探索过，转向{action.direction}避免重复"
         else:
             navigation_message = f"顺时针沿未开区域边缘向{action.direction}探索，并校正开/未开比例"
@@ -946,11 +1098,11 @@ class LocalAutomation:
         return observation.geometry.center(target.row, target.column)
 
     def _stuck_pattern(self) -> str | None:
-        """Classify the recent navigation drags: oscillation, rotation or None.
+        """Classify the recent navigation drags, or None when they look sane.
 
-        Oscillation means the last moves keep flipping to the exact opposite
-        direction (up/down/up/...). Rotation means every consecutive pair of
-        moves turns the same way by 90 degrees (a full circle)."""
+        oscillation: the last moves keep flipping to the exact opposite
+        direction (up/down/up/...). rotation: every consecutive pair of moves
+        turns the same way by 90 degrees (a full circle)."""
         directions = list(self.recent_drag_directions)
         opposite = LocalNavigator.OPPOSITE
         if len(directions) >= self.OSCILLATION_THRESHOLD and all(
@@ -979,16 +1131,19 @@ class LocalAutomation:
         Returns the (possibly re-planned) drag action plus a status note for
         the tactical console; the note is None on ordinary drags."""
         if self.escape_direction is not None:
+            direction = self.escape_direction
             self.escape_moves_done += 1
-            action = plan_drag(observation, self.navigator, forced_direction=self.escape_direction)
+            self.escape_pending = True
+            action = self._safe_plan_drag(observation, direction)
             if self.escape_moves_done >= self.ESCAPE_MOVES:
                 note = f"脱困移动完成（{self.escape_moves_done}/{self.ESCAPE_MOVES}），继续扫雷"
-                self.escape_direction = None
-                self.escape_moves_done = 0
-                self.recent_drag_directions.clear()
+                self._finish_escape(direction)
+            elif self.escape_direction is None:
+                # _safe_plan_drag could not fit a single drag this way.
+                note = f"向{direction}脱困受阻，已改为绕行并继续扫雷"
             else:
                 note = (
-                    f"脱困移动中，向{self.escape_direction}"
+                    f"脱困移动中，向{direction}"
                     f"（{self.escape_moves_done}/{self.ESCAPE_MOVES}）"
                 )
             return action, note
@@ -1010,11 +1165,85 @@ class LocalAutomation:
         observation: Observation,
         label: str,
     ) -> tuple[PlannedAction, str | None]:
-        direction = self.rng.choice(LocalNavigator.DIRECTIONS)
+        # Never flee in the direction just fled (and never straight back from
+        # it): two consecutive bursts on the same axis only wobble in place.
+        avoid: set[str] = set()
+        if self.last_escape_direction is not None:
+            avoid.add(self.last_escape_direction)
+            avoid.add(LocalNavigator.OPPOSITE[self.last_escape_direction])
+        candidates = self.navigator.escape_candidates(observation, avoid)
+        direction = self.rng.choice(candidates)
+        self.navigator.release_commitment()
         self.escape_direction = direction
         self.escape_moves_done = 1
-        action = plan_drag(observation, self.navigator, forced_direction=direction)
+        self.escape_pending = True
+        action = self._safe_plan_drag(observation, direction)
+        if self.escape_direction is None:
+            return action, f"检测到{label}，但{direction}方向无法拖动，已改为绕行"
         return action, f"检测到{label}，向{direction}脱困移动（1/{self.ESCAPE_MOVES}）"
+
+    def _safe_plan_drag(
+        self,
+        observation: Observation,
+        forced_direction: str | None = None,
+    ) -> PlannedAction:
+        """A drag that cannot fit must never abort the run (board edge).
+
+        plan_drag raises when no anchor leaves room for a full gesture, which
+        used to kill the automation thread mid-escape. Here the offending
+        direction is marked blocked, re-planned once, and finally replaced by a
+        blind pan that always fits inside the window.
+        """
+        try:
+            return plan_drag(observation, self.navigator, forced_direction=forced_direction)
+        except RuntimeError:
+            self.edge_drags += 1
+            stuck_direction = forced_direction or self.navigator.last_direction
+            if stuck_direction:
+                self.navigator.remember_blocked(stuck_direction)
+            if forced_direction is not None:
+                self.escape_direction = None
+                self.escape_moves_done = 0
+                self.escape_pending = False
+                self.navigator.release_commitment()
+            try:
+                return plan_drag(observation, self.navigator)
+            except RuntimeError:
+                self.recovery_note = "可拖动空间不足，已改用盲拖继续"
+                return self._generic_recovery_action(
+                    observation.frame.window_rect,
+                    self.edge_drags,
+                )
+
+    def _finish_escape(self, direction: str | None) -> None:
+        """End the burst and commit to keep heading away from that area."""
+        self.escape_direction = None
+        self.escape_moves_done = 0
+        self.escape_pending = False
+        self.recent_drag_directions.clear()
+        if direction is not None:
+            self.last_escape_direction = direction
+            self.navigator.commit_to(direction, self.ESCAPE_COMMIT_MOVES)
+
+    def _clear_escape_state(self) -> None:
+        """Productive work makes the escape - and its commitment - moot."""
+        self.escape_direction = None
+        self.escape_moves_done = 0
+        self.escape_pending = False
+        self.recent_drag_directions.clear()
+        self.navigator.release_commitment()
+
+    def _abort_escape(self) -> str:
+        """The burst stopped moving (board edge): end it and go sideways."""
+        direction = self.escape_direction
+        done = self.escape_moves_done
+        self._finish_escape(direction)
+        if direction is not None:
+            self.navigator.remember_blocked(direction)
+        return (
+            f"向{direction}脱困在第 {done}/{self.ESCAPE_MOVES} 次到达边界，"
+            "结束脱困并改为绕行"
+        )
 
     def _observe_after_chest(self, stop_event: threading.Event, previous: Observation) -> Observation:
         wait_for_stable = getattr(self.observer, "wait_for_stable", None)
